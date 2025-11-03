@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Facturas Hogar Alek</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="wrap">
+    <h1>Facturas Hogar Alek</h1>
+    <div id="mensaje" aria-live="polite" class="hide"></div>
+  </header>
+
+  <main class="wrap">
+    <div id="loader" class="loader">Cargando facturas…</div>
+
+    <table class="tabla" aria-describedby="mensaje">
+      <thead>
+        <tr>
+          <th>Factura</th>
+          <th>Referencia</th>
+          <th>Valor</th>
+          <th>Último pago</th>
+          <th>Estado</th>
+          <th>Acción</th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <!-- Se llena por JS -->
+      </tbody>
+    </table>
+  </main>
+
+  <footer class="wrap foot">
+    <small>Hecho con ❤️ por ustedes</small>
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>

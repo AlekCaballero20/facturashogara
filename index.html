@@ -8,12 +8,24 @@
 </head>
 <body>
   <header class="wrap">
-    <h1>Facturas Hogar Alek</h1>
+    <div class="head">
+      <h1>Facturas Hogar Alek</h1>
+
+      <div class="head-actions">
+        <!-- Botón nuevo: estadísticas -->
+        <button id="btnStats" class="btn ghost" type="button" aria-haspopup="dialog" aria-controls="statsModal">
+          📊 Ver estadísticas
+        </button>
+      </div>
+    </div>
+
     <div id="mensaje" aria-live="polite" class="hide"></div>
   </header>
 
-  <main class="wrap">
-    <div id="loader" class="loader">Cargando facturas…</div>
+  <main class="wrap" id="main" aria-busy="false">
+    <div id="loader" class="loader hide" role="status" aria-live="polite">
+      Cargando facturas…
+    </div>
 
     <table class="tabla" aria-describedby="mensaje">
       <thead>
@@ -21,6 +33,7 @@
           <th>Factura</th>
           <th>Referencia</th>
           <th>Valor</th>
+          <th>Método de pago</th>
           <th>Último pago</th>
           <th>Estado</th>
           <th>Acción</th>
@@ -31,6 +44,30 @@
       </tbody>
     </table>
   </main>
+
+  <!-- =========================
+       MODAL: ESTADÍSTICAS
+       (lo llena app.js con action=stats)
+  ========================== -->
+  <div id="statsModal" class="modal hide" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
+    <div class="modal-backdrop" data-close="stats"></div>
+
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="statsTitle">Estadísticas del Histórico</h2>
+        <button id="btnCloseStats" class="btn icon" type="button" aria-label="Cerrar" data-close="stats">✕</button>
+      </div>
+
+      <div id="statsBody" class="modal-body">
+        <!-- app.js inserta aquí el resumen -->
+        <p class="muted">Cargando estadísticas…</p>
+      </div>
+
+      <div class="modal-foot">
+        <button class="btn" type="button" data-close="stats">Cerrar</button>
+      </div>
+    </div>
+  </div>
 
   <footer class="wrap foot">
     <small>Hecho con ❤️ por ustedes</small>

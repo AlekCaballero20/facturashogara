@@ -1,66 +1,208 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+
   <title>Facturas Hogar Alek</title>
-  <link rel="stylesheet" href="./styles.css">
+  <meta name="description" content="Control simple y claro de pagos de facturas del hogar (Alek). Estado del mes, edición rápida y estadísticas." />
+
+  <meta name="color-scheme" content="light" />
+  <meta name="theme-color" content="#f6f8ff" />
+
+  <!-- Performance hints -->
+  <link rel="preconnect" href="https://script.google.com" crossorigin />
+  <link rel="preconnect" href="https://docs.google.com" crossorigin />
+
+  <!-- (Opcional) PWA -->
+  <!-- <link rel="manifest" href="./manifest.webmanifest"> -->
+
+  <link rel="stylesheet" href="./styles.css" />
 </head>
+
 <body>
+  <!-- Skip link -->
+  <a class="sr-only-focusable" href="#main">Saltar al contenido</a>
+
+  <!-- Header -->
   <header class="wrap">
     <div class="head">
-      <h1>Facturas Hogar Alek</h1>
+      <div class="brand" aria-label="Encabezado del sistema">
+        <div class="brandMark" aria-hidden="true">A</div>
+        <div class="brandText">
+          <h1>Facturas Hogar Alek</h1>
+          <p class="sub">Control de pagos · Hogar</p>
+        </div>
+      </div>
 
-      <div class="head-actions">
-        <!-- Botón nuevo: estadísticas -->
-        <button id="btnStats" class="btn ghost" type="button" aria-haspopup="dialog" aria-controls="statsModal">
-          📊 Ver estadísticas
+      <div class="head-actions" aria-label="Acciones principales">
+        <button id="btnRefresh" class="btn ghost" type="button" title="Actualizar lista" aria-label="Actualizar lista">
+          ↻ Actualizar
+        </button>
+
+        <button id="btnStats" class="btn ghost" type="button"
+          aria-haspopup="dialog" aria-controls="statsModal" aria-label="Abrir estadísticas">
+          📊 Estadísticas
+        </button>
+
+        <button id="btnExport" class="btn ghost" type="button" title="Exportar (próximamente)" aria-label="Exportar" disabled>
+          ⤓ Exportar
+        </button>
+
+        <button id="btnImport" class="btn ghost" type="button" title="Importar (próximamente)" aria-label="Importar" disabled>
+          ⤒ Importar
         </button>
       </div>
     </div>
 
-    <div id="mensaje" aria-live="polite" class="hide"></div>
+    <div id="mensaje" class="hide" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <section class="kpi" aria-label="Resumen del mes">
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="k">Total este mes</div>
+          <div id="kpiTotalMes" class="v">—</div>
+          <div id="kpiDeltaMes" class="h muted">vs. mes anterior: —</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="k">Pagadas este mes</div>
+          <div id="kpiPagadas" class="v">—</div>
+          <div class="h muted">de <span id="kpiTotalFacturas">—</span> facturas</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="k">Pendientes este mes</div>
+          <div id="kpiPendientes" class="v">—</div>
+          <div class="h muted">valor pendiente: <span id="kpiValorPendiente">—</span></div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="k">Método top</div>
+          <div id="kpiMetodoTop" class="v">—</div>
+          <div class="h muted">por total pagado</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="filters" aria-label="Filtros de facturas">
+      <div class="filters-row">
+        <label class="field">
+          <span class="label">Buscar</span>
+          <input id="q" type="search" placeholder="Factura o referencia…"
+            autocomplete="off" inputmode="search" aria-label="Buscar por factura o referencia" />
+        </label>
+
+        <label class="field">
+          <span class="label">Estado</span>
+          <select id="fEstado" aria-label="Filtrar por estado">
+            <option value="all">Todas</option>
+            <option value="pagado">Pagadas (este mes)</option>
+            <option value="pendiente">Pendientes (este mes)</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span class="label">Método</span>
+          <select id="fMetodo" aria-label="Filtrar por método">
+            <option value="all">Todos</option>
+          </select>
+        </label>
+
+        <div class="filters-actions" aria-label="Acciones de filtros">
+          <button id="btnClearFilters" class="btn ghost" type="button" title="Limpiar filtros" aria-label="Limpiar filtros">
+            ✕ Limpiar
+          </button>
+
+          <button id="btnQuickPay" class="btn" type="button" title="Registro rápido (próximamente)" aria-label="Nuevo pago" disabled>
+            ✅ Nuevo pago
+          </button>
+        </div>
+      </div>
+
+      <p class="muted hint">
+        Tip: edita <strong>Valor</strong> y <strong>Método</strong> directo en la tabla. Enter guarda, Esc revierte.
+      </p>
+    </section>
   </header>
 
   <main class="wrap" id="main" aria-busy="false">
+    <noscript>
+      <div class="empty" role="status" aria-live="polite" style="margin-top:16px">
+        <div class="empty-emoji" aria-hidden="true">⚙️</div>
+        <div class="empty-title">Necesitas activar JavaScript</div>
+        <div class="empty-sub muted">Esta app depende de JS para cargar y editar facturas.</div>
+      </div>
+    </noscript>
+
     <div id="loader" class="loader hide" role="status" aria-live="polite">
       Cargando facturas…
     </div>
 
     <table class="tabla" aria-describedby="mensaje">
+      <caption class="sr">Listado de facturas y estado de pago del mes actual</caption>
       <thead>
         <tr>
-          <th>Factura</th>
-          <th>Referencia</th>
-          <th>Valor</th>
-          <th>Método de pago</th>
-          <th>Último pago</th>
-          <th>Estado</th>
-          <th>Acción</th>
+          <th scope="col">Factura</th>
+          <th scope="col">Referencia</th>
+          <th scope="col">Valor</th>
+          <th scope="col">Método</th>
+          <th scope="col">Último pago</th>
+          <th scope="col">Estado</th>
+          <th scope="col">Acción</th>
         </tr>
       </thead>
-      <tbody id="tbody">
-        <!-- Se llena por JS -->
-      </tbody>
+      <tbody id="tbody"></tbody>
     </table>
+
+    <div id="emptyState" class="empty hide" role="status" aria-live="polite">
+      <div class="empty-emoji" aria-hidden="true">🧾</div>
+      <div class="empty-title">No hay resultados</div>
+      <div class="empty-sub muted">Prueba cambiando filtros o la búsqueda.</div>
+    </div>
   </main>
 
-  <!-- =========================
-       MODAL: ESTADÍSTICAS
-       (lo llena app.js con action=stats)
-  ========================== -->
-  <div id="statsModal" class="modal hide" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
-    <div class="modal-backdrop" data-close="stats"></div>
+  <!-- Modal: Estadísticas -->
+  <div id="statsModal" class="modal hide" role="dialog" aria-modal="true"
+    aria-labelledby="statsTitle" aria-describedby="statsDesc">
+    <div class="modal-backdrop" data-close="stats" aria-hidden="true"></div>
 
-    <div class="modal-card">
+    <div class="modal-card" role="document">
       <div class="modal-head">
-        <h2 id="statsTitle">Estadísticas del Histórico</h2>
+        <div>
+          <h2 id="statsTitle">Estadísticas · Hogar Alek</h2>
+          <p id="statsDesc" class="muted" style="margin:6px 0 0">Resumen, métodos, meses y pendientes.</p>
+        </div>
         <button id="btnCloseStats" class="btn icon" type="button" aria-label="Cerrar" data-close="stats">✕</button>
       </div>
 
-      <div id="statsBody" class="modal-body">
-        <!-- app.js inserta aquí el resumen -->
-        <p class="muted">Cargando estadísticas…</p>
+      <div class="tabs" role="tablist" aria-label="Secciones de estadísticas">
+        <button class="tab is-active" type="button" role="tab" aria-selected="true"
+          aria-controls="tabResumen" id="tResumen" data-tab="resumen">Resumen</button>
+        <button class="tab" type="button" role="tab" aria-selected="false"
+          aria-controls="tabMetodos" id="tMetodos" data-tab="metodos">Métodos</button>
+        <button class="tab" type="button" role="tab" aria-selected="false"
+          aria-controls="tabMeses" id="tMeses" data-tab="meses">Meses</button>
+        <button class="tab" type="button" role="tab" aria-selected="false"
+          aria-controls="tabPendientes" id="tPendientes" data-tab="pendientes">Pendientes</button>
+      </div>
+
+      <div class="modal-body">
+        <section id="tabResumen" class="tab-panel" role="tabpanel" aria-labelledby="tResumen">
+          <div id="statsBody"><p class="muted">Cargando estadísticas…</p></div>
+        </section>
+
+        <section id="tabMetodos" class="tab-panel hide" role="tabpanel" aria-labelledby="tMetodos">
+          <div id="statsMetodos"><p class="muted">Cargando métodos…</p></div>
+        </section>
+
+        <section id="tabMeses" class="tab-panel hide" role="tabpanel" aria-labelledby="tMeses">
+          <div id="statsMeses"><p class="muted">Cargando meses…</p></div>
+        </section>
+
+        <section id="tabPendientes" class="tab-panel hide" role="tabpanel" aria-labelledby="tPendientes">
+          <div id="statsPendientes"><p class="muted">Cargando pendientes…</p></div>
+        </section>
       </div>
 
       <div class="modal-foot">
@@ -70,9 +212,14 @@
   </div>
 
   <footer class="wrap foot">
-    <small>Hecho con ❤️ por ustedes</small>
+    <small>Hecho con ❤️ por Alek · Facturas Hogar</small>
   </footer>
 
-  <script src="./app.js"></script>
+  <!-- Scripts (orden correcto, rutas correctas con /js, y defer para mantener el orden) -->
+  <script defer src="./js/config.js"></script>
+  <script defer src="./js/state.js"></script>
+  <script defer src="./js/services.api.js"></script>
+  <script defer src="./js/ui.render.js"></script>
+  <script defer src="./js/app.js"></script>
 </body>
 </html>

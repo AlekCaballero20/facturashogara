@@ -1,374 +1,143 @@
 "use strict";
 
-/* ============================================================================
-   FACTURAS HOGAR ALEK · services.api.js (Pro v2)
-   - Centraliza comunicación con GAS (Apps Script)
-   - Retry básico e inteligente
-   - AbortController ready
-   - Cache opcional con invalidación clara
-   - Normalización de respuestas
-   - Endpoints nuevos: historial, quickPay
-============================================================================ */
-
 (function () {
   if (window.API) return;
-
-  if (!window.CFG) {
-    throw new Error("CFG no existe. Carga config.js antes.");
-  }
-
   const CFG = window.CFG;
+  const CACHE = window.__CACHE__;
   const BASE = String(CFG.SCRIPT_URL || "").trim();
 
-  if (!BASE) {
-    throw new Error("CFG.SCRIPT_URL está vacío.");
-  }
-
-  const DBG = window.__DBG__ || (() => {});
-  const CACHE = window.__CACHE__ || null;
-
-  const DEFAULTS = Object.freeze({
-    RETRY: 1,
-    TIMEOUT_MS: 15000,
-  });
-
-  const CACHE_KEYS = Object.freeze({
-    FACTURAS: CFG.CACHE?.FACTURAS_KEY || "facturas_hogar_cache_v1",
-    STATS: CFG.CACHE?.STATS_KEY || "facturas_hogar_stats_cache_v1",
-    HISTORICO: "facturas_hogar_historico_cache_v1",
-  });
-
-  /* =========================
-     INTERNAL HELPERS
-  ========================= */
-
-  function buildURL(params = {}) {
-    const url = new URL(BASE);
-
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== undefined && v !== null && v !== "") {
-        url.searchParams.set(k, String(v));
-      }
-    });
-
-    return url.toString();
-  }
-
-  function withTimeoutSignal(timeoutMs, externalSignal) {
-    const ctrl = new AbortController();
-    let timedOut = false;
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      ctrl.abort(new DOMException("La solicitud tardó demasiado.", "AbortError"));
-    }, timeoutMs || DEFAULTS.TIMEOUT_MS);
-
-    if (externalSignal) {
-      if (externalSignal.aborted) {
-        clearTimeout(timer);
-        ctrl.abort(externalSignal.reason || new DOMException("Solicitud abortada.", "AbortError"));
-      } else {
-        externalSignal.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(timer);
-            ctrl.abort(externalSignal.reason || new DOMException("Solicitud abortada.", "AbortError"));
-          },
-          { once: true }
-        );
-      }
-    }
-
-    return {
-      signal: ctrl.signal,
-      cleanup() {
-        clearTimeout(timer);
-      },
-      wasTimeout() {
-        return timedOut;
-      },
-    };
-  }
-
-  async function fetchJSON(url, opts = {}, retry = DEFAULTS.RETRY) {
-    const {
-      method = "GET",
-      signal,
-      timeoutMs = DEFAULTS.TIMEOUT_MS,
-      headers,
-      body,
-      ...rest
-    } = opts || {};
-
-    const timeout = withTimeoutSignal(timeoutMs, signal);
-
-    DBG("API request:", method, url);
-
-    try {
-      const res = await fetch(url, {
-        method,
-        cache: "no-store",
-        signal: timeout.signal,
-        headers,
-        body,
-        ...rest,
-      });
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-
-      const text = await res.text();
-
-      let json;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        throw new Error("La respuesta no es JSON válido.");
-      }
-
-      return json;
-    } catch (err) {
-      const isAbort = err?.name === "AbortError";
-      const canRetry = retry > 0 && !isAbort;
-
-      DBG("API error:", err?.message || err);
-
-      if (canRetry) {
-        DBG("Retrying request…", url);
-        return fetchJSON(url, opts, retry - 1);
-      }
-
-      if (isAbort && timeout.wasTimeout()) {
-        throw new Error("La solicitud tardó demasiado.");
-      }
-
-      throw err;
-    } finally {
-      timeout.cleanup();
-    }
-  }
-
-  function assertOk(json, defaultMsg = "Error API") {
-    if (!json || json.ok === false) {
-      throw new Error(json?.error || defaultMsg);
-    }
-    return json;
-  }
-
-  function getCache(key) {
-    if (!CACHE || !CFG.CACHE?.ENABLED || !key) return null;
-    try {
-      return CACHE.get(key);
-    } catch {
-      return null;
-    }
-  }
-
-  function setCache(key, value) {
-    if (!CACHE || !CFG.CACHE?.ENABLED || !key) return false;
-    try {
-      return CACHE.set(key, value);
-    } catch {
-      return false;
-    }
-  }
-
-  function delCache(key) {
-    if (!CACHE || !key) return;
-    try {
-      CACHE.del(key);
-    } catch {}
-  }
-
-  function invalidateCoreCaches() {
-    delCache(CACHE_KEYS.FACTURAS);
-    delCache(CACHE_KEYS.STATS);
-    delCache(CACHE_KEYS.HISTORICO);
-  }
-
-  function normalizeRowsPayload(json, label = "rows") {
-    if (Array.isArray(json)) return json;
-    if (json && Array.isArray(json.rows)) return json.rows;
-    if (json && Array.isArray(json.data)) return json.data;
-    throw new Error(`Formato inesperado (${label})`);
-  }
-
-  function normalizeStatsPayload(json) {
-    const out = assertOk(json, "No se pudieron cargar estadísticas");
-    return out;
-  }
-
-  function cleanPayload(obj = {}) {
+  function clean(obj = {}) {
     const out = {};
     Object.entries(obj).forEach(([k, v]) => {
       if (v !== undefined && v !== null && v !== "") out[k] = v;
     });
+    if (CFG.API_KEY) out.apiKey = CFG.API_KEY;
     return out;
   }
-
-  function numberOrEmpty(v) {
-    if (v == null || v === "") return "";
-    const n = Number(v);
-    return Number.isFinite(n) ? n : "";
+  function buildURL(action, params = {}) {
+    const url = new URL(BASE);
+    Object.entries(clean({ action, ...params })).forEach(([k, v]) => url.searchParams.set(k, String(v)));
+    return url.toString();
   }
-
-  /* =========================
-     REQUEST WRAPPERS
-  ========================= */
-
-  async function getAction(action, params = {}, opts = {}) {
-    const url = buildURL({ action, ...cleanPayload(params) });
-    return fetchJSON(url, opts, opts?.retry ?? DEFAULTS.RETRY);
+  function timeoutSignal(ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    return { signal: ctrl.signal, done: () => clearTimeout(timer) };
   }
-
-  /* =========================
-     API METHODS
-  ========================= */
+  async function fetchJSON(url, opts = {}, retries = CFG.API.RETRY) {
+    const t = timeoutSignal(opts.timeoutMs || CFG.API.TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { method: opts.method || "GET", cache: "no-store", signal: t.signal, headers: opts.headers, body: opts.body });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const txt = await res.text();
+      const json = txt ? JSON.parse(txt) : {};
+      if (json && json.ok === false) throw new Error(json.error || "No se pudo completar la acción.");
+      return json;
+    } catch (err) {
+      if (err.name === "AbortError") throw new Error("No se pudo cargar la información. Revisa la conexión o el despliegue de Apps Script.");
+      if (retries > 0) return fetchJSON(url, opts, retries - 1);
+      throw err;
+    } finally {
+      t.done();
+    }
+  }
+  async function get(action, params, opts) {
+    return fetchJSON(buildURL(action, params), opts);
+  }
+  async function post(action, payload, opts = {}) {
+    return fetchJSON(buildURL(action, {}), {
+      ...opts,
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(clean({ action, ...payload })),
+    });
+  }
+  function rows(json) {
+    if (Array.isArray(json)) return json;
+    if (Array.isArray(json.rows)) return json.rows;
+    if (Array.isArray(json.data)) return json.data;
+    return [];
+  }
+  function cacheGet(key) { return CFG.CACHE.ENABLED ? CACHE.get(key) : null; }
+  function cacheSet(key, value) { if (CFG.CACHE.ENABLED) CACHE.set(key, value); }
+  function invalidate() { CACHE.clearAll(); }
 
   async function listarFacturas(opts = {}) {
-    const cacheKey = CACHE_KEYS.FACTURAS;
-
-    const cached = getCache(cacheKey);
-    if (cached) {
-      DBG("Cache HIT facturas");
-      return cached;
+    const key = CFG.CACHE.FACTURAS_KEY;
+    if (!opts.force) {
+      const c = cacheGet(key);
+      if (c) return c;
     }
-
-    const json = await getAction("listar", {}, opts);
-    const rows = normalizeRowsPayload(json, "listar");
-
-    setCache(cacheKey, rows);
-    return rows;
+    const data = rows(await get("listar", {}, opts));
+    cacheSet(key, data);
+    return data;
   }
-
-  async function registrarPago(row, opts = {}) {
-    const json = await getAction(
-      "registrar",
-      { row: numberOrEmpty(row) },
-      opts
-    );
-
-    invalidateCoreCaches();
-    return assertOk(json, "Error al registrar pago");
+  async function registrarPago(payload = {}, opts = {}) {
+    const json = await post("registrar", payload, opts);
+    invalidate();
+    return json;
   }
-
-  async function editarValor(row, valor, opts = {}) {
-    const json = await getAction(
-      "editar",
-      {
-        row: numberOrEmpty(row),
-        valor: numberOrEmpty(valor),
-      },
-      opts
-    );
-
-    invalidateCoreCaches();
-    return assertOk(json, "Error al editar valor");
-  }
-
-  async function editarMetodo(row, metodo, opts = {}) {
-    const json = await getAction(
-      "editarMetodo",
-      {
-        row: numberOrEmpty(row),
-        metodo: String(metodo ?? "").trim(),
-      },
-      opts
-    );
-
-    invalidateCoreCaches();
-    return assertOk(json, "Error al editar método");
-  }
-
-  async function stats(opts = {}) {
-    const cacheKey = CACHE_KEYS.STATS;
-
-    const cached = getCache(cacheKey);
-    if (cached) {
-      DBG("Cache HIT stats");
-      return cached;
-    }
-
-    const json = await getAction("stats", {}, opts);
-    const out = normalizeStatsPayload(json);
-
-    setCache(cacheKey, out);
-    return out;
-  }
-
-  async function historial(opts = {}) {
-    const cacheKey = CACHE_KEYS.HISTORICO;
-
-    const cached = getCache(cacheKey);
-    if (cached) {
-      DBG("Cache HIT historico");
-      return cached;
-    }
-
-    const json = await getAction("historial", {}, opts);
-    const rows = normalizeRowsPayload(json, "historial");
-
-    setCache(cacheKey, rows);
-    return rows;
-  }
-
   async function quickPay(payload = {}, opts = {}) {
-    const factura = String(payload.factura ?? "").trim();
-    const valorPagado = numberOrEmpty(payload.valorPagado);
-    const metodo = String(payload.metodo ?? "").trim();
-    const fecha = String(payload.fecha ?? "").trim();
-    const nota = String(payload.nota ?? "").trim();
-
-    if (!factura) {
-      throw new Error("Falta la factura para quickPay.");
+    const json = await post("quickpay", payload, opts);
+    invalidate();
+    return json;
+  }
+  async function editarValor(row, valor, opts = {}) {
+    const json = await post("editar", { row, valor }, opts);
+    invalidate();
+    return json;
+  }
+  async function editarMetodo(row, metodo, opts = {}) {
+    const json = await post("editarMetodo", { row, metodo }, opts);
+    invalidate();
+    return json;
+  }
+  async function editarFactura(payload = {}, opts = {}) {
+    try {
+      const json = await post("editarFactura", payload, opts);
+      invalidate();
+      return json;
+    } catch (err) {
+      const onlyLegacy = ["row", "valorBase", "metodo"].every((k) => payload[k] !== undefined || k !== "row") &&
+        !["diaVencimiento", "categoria", "responsable", "presupuestoMensual", "linkPago", "nota", "activa"].some((k) => payload[k] !== undefined);
+      if (!onlyLegacy) throw err;
+      if (payload.valorBase !== undefined) await editarValor(payload.row, payload.valorBase, opts);
+      if (payload.metodo !== undefined) await editarMetodo(payload.row, payload.metodo, opts);
+      return { ok: true, fallback: true };
     }
-
-    if (valorPagado === "" || !Number.isFinite(Number(valorPagado))) {
-      throw new Error("Falta un valor pagado válido para quickPay.");
+  }
+  async function stats(opts = {}) {
+    const key = CFG.CACHE.STATS_KEY;
+    if (!opts.force) {
+      const c = cacheGet(key);
+      if (c) return c;
     }
-
-    const json = await getAction(
-      "quickpay",
-      cleanPayload({
-        factura,
-        valorPagado,
-        metodo,
-        fecha,
-        nota,
-      }),
-      opts
-    );
-
-    invalidateCoreCaches();
-    return assertOk(json, "No se pudo registrar el pago rápido");
+    const json = await get("stats", {}, opts);
+    cacheSet(key, json);
+    return json;
   }
-
-  /* =========================
-     OPTIONAL UTILITIES
-  ========================= */
-
-  function clearCache() {
-    invalidateCoreCaches();
+  async function historial(params = {}, opts = {}) {
+    const useCache = !Object.keys(params || {}).length && !opts.force;
+    const key = CFG.CACHE.HISTORICO_KEY;
+    if (useCache) {
+      const c = cacheGet(key);
+      if (c) return c;
+    }
+    const data = rows(await get("historial", params, opts));
+    if (useCache) cacheSet(key, data);
+    return data;
   }
-
-  function getBaseUrl() {
-    return BASE;
+  async function resumenMes(params = {}, opts = {}) {
+    return get("resumenMes", params, opts);
   }
-
-  /* =========================
-     PUBLIC API
-  ========================= */
+  async function cerrarMes(payload = {}, opts = {}) {
+    const json = await post("cerrarMes", payload, opts);
+    invalidate();
+    return json;
+  }
 
   window.API = Object.freeze({
-    listarFacturas,
-    registrarPago,
-    editarValor,
-    editarMetodo,
-    stats,
-    historial,
-    quickPay,
-    clearCache,
-    getBaseUrl,
+    listarFacturas, registrarPago, quickPay, editarValor, editarMetodo, editarFactura,
+    stats, historial, resumenMes, cerrarMes, clearCache: invalidate,
   });
 })();

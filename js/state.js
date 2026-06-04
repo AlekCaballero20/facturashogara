@@ -1,584 +1,206 @@
 "use strict";
 
-/* ============================================================================
-   FACTURAS HOGAR ALEK · state.js (Pro v2)
-   - Estado centralizado:
-     facturas, filtered, stats, historico, filtros principales, filtros histórico, ui, meta
-   - Pub/Sub liviano (on/off/once) + wildcard
-   - Mutación controlada + snapshots seguros
-   - Helpers de negocio (isPagoDelMes, extractMetodos, extractHistoricoYears, etc.)
-   - Persistencia opcional (si existe __CACHE__)
-   - Protecciones: no pisar window.STATE si ya existe
-============================================================================ */
-
 (function () {
   if (window.STATE) return;
 
-  const CFG = window.CFG || {};
-  const DBG = window.__DBG__ || (() => {});
-  const CACHE = window.__CACHE__ || null;
-
-  const CACHE_KEYS = Object.freeze({
-    FACTURAS: CFG?.CACHE?.FACTURAS_KEY || "facturas_hogar_cache_v1",
-    STATS: CFG?.CACHE?.STATS_KEY || "facturas_hogar_stats_cache_v1",
-    HISTORICO: "facturas_hogar_historico_cache_v1",
-  });
-
-  const DEFAULTS = Object.freeze({
+  const store = {
     facturas: [],
     filtered: [],
     stats: null,
-
     historico: [],
-    historicoFiltered: [],
-
-    filters: {
-      q: "",
-      estado: "all",   // all | pagado | pendiente
-      metodo: "all",   // all | "Nequi" | "Daviplata" | etc
-    },
-
-    historyFilters: {
-      q: "",
-      year: "all",
-      method: "all",
-    },
-
-    ui: {
-      activeStatsTab: "resumen",
-      loadedStatsTabs: ["resumen"],
-      statsOpen: false,
-      quickPayOpen: false,
-    },
-
-    meta: {
-      lastLoadedAt: 0,
-      lastStatsAt: 0,
-      lastHistoricoAt: 0,
-      isBusy: false,
-      lastError: "",
-      version: 2,
-    },
-  });
-
-  /* =========================
-     INTERNAL STORE
-  ========================= */
-  const store = structuredCloneSafe(DEFAULTS);
+    cierres: [],
+    filters: { q: "", estado: "all", metodo: "all", categoria: "all", responsable: "all", orden: "urgencia" },
+    ui: { activeStatsTab: "resumen", selectedFactura: null },
+  };
 
   const listeners = new Map();
-  const wildcards = new Set();
+  const emit = (event, payload) => (listeners.get(event) || []).forEach((fn) => fn(payload));
+  const on = (event, fn) => {
+    if (!listeners.has(event)) listeners.set(event, new Set());
+    listeners.get(event).add(fn);
+    return () => listeners.get(event).delete(fn);
+  };
 
-  function structuredCloneSafe(obj) {
-    try {
-      return structuredClone(obj);
-    } catch {
-      return JSON.parse(JSON.stringify(obj));
-    }
+  function norm(v) {
+    return String(v ?? "").trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   }
-
-  function emit(eventName, payload) {
-    const set = listeners.get(eventName);
-    if (set && set.size) {
-      set.forEach((fn) => {
-        try {
-          fn(payload);
-        } catch (e) {
-          console.error("[STATE] listener error:", e);
-        }
-      });
-    }
-
-    if (wildcards.size) {
-      wildcards.forEach((fn) => {
-        try {
-          fn(eventName, payload);
-        } catch (e) {
-          console.error("[STATE] wildcard listener error:", e);
-        }
-      });
-    }
+  function text(v) { return String(v ?? "").trim(); }
+  function num(v) {
+    if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+    const digits = String(v ?? "").replace(/[^\d.-]/g, "");
+    return digits ? Number(digits) || 0 : 0;
   }
-
-  function on(eventName, fn) {
-    if (eventName === "*") {
-      wildcards.add(fn);
-      return () => wildcards.delete(fn);
-    }
-    if (!listeners.has(eventName)) listeners.set(eventName, new Set());
-    listeners.get(eventName).add(fn);
-    return () => off(eventName, fn);
-  }
-
-  function once(eventName, fn) {
-    const unsub = on(eventName, (payload, maybePayload) => {
-      unsub();
-      if (eventName === "*") fn(payload, maybePayload);
-      else fn(payload);
-    });
-    return unsub;
-  }
-
-  function off(eventName, fn) {
-    if (eventName === "*") {
-      wildcards.delete(fn);
-      return;
-    }
-    const set = listeners.get(eventName);
-    if (!set) return;
-    set.delete(fn);
-  }
-
-  /* =========================
-     PRIVATE CACHE HELPERS
-  ========================= */
-  function _cacheSet(key, value) {
-    if (!CACHE || !CFG?.CACHE?.ENABLED || !key) return;
-    try {
-      CACHE.set(key, value);
-    } catch {}
-  }
-
-  function _cacheGet(key) {
-    if (!CACHE || !CFG?.CACHE?.ENABLED || !key) return null;
-    try {
-      return CACHE.get(key);
-    } catch {
-      return null;
-    }
-  }
-
-  function _cacheDel(key) {
-    if (!CACHE || !key) return;
-    try {
-      CACHE.del?.(key);
-    } catch {}
-  }
-
-  function _touchMeta(key) {
-    store.meta[key] = Date.now();
-  }
-
-  /* =========================
-     NORMALIZERS / HELPERS
-  ========================= */
-  function safeArray(v) {
-    return Array.isArray(v) ? v : [];
-  }
-
-  function normalizeText(v) {
-    return String(v ?? "")
-      .trim()
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "");
-  }
-
-  function parseDateFlexible(v) {
+  function parseDate(v) {
     if (!v) return null;
-    if (v instanceof Date && !isNaN(v.getTime())) return v;
-
+    if (v instanceof Date && !isNaN(v)) return v;
     const s = String(v).trim();
-
-    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-    if (m) {
-      const d = Number(m[1]);
-      const mo = Number(m[2]) - 1;
-      const y = Number(m[3].length === 2 ? "20" + m[3] : m[3]);
-      const dt = new Date(y, mo, d);
-      return isNaN(dt.getTime()) ? null : dt;
+    let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (m) return new Date(Number(m[3].length === 2 ? "20" + m[3] : m[3]), Number(m[2]) - 1, Number(m[1]));
+    m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    const d = new Date(s);
+    return isNaN(d) ? null : d;
+  }
+  function fmtInputDate(d = new Date()) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+  function monthKey(d = new Date()) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+  function isPaidThisMonth(fecha) {
+    const d = parseDate(fecha);
+    const h = new Date();
+    return !!d && d.getFullYear() === h.getFullYear() && d.getMonth() === h.getMonth();
+  }
+  function lastDay(year, monthIndex) {
+    return new Date(year, monthIndex + 1, 0).getDate();
+  }
+  function calcLocalStatus(f, ref = new Date()) {
+    if (isPaidThisMonth(f.ultimoPago)) {
+      return { estadoCalculado: "pagada", diasParaVencer: null, fechaVencimiento: "", venceTexto: "Pagada este mes" };
     }
-
-    const dt = new Date(s);
-    return isNaN(dt.getTime()) ? null : dt;
-  }
-
-  function getYearFromDateLike(v) {
-    const dt = parseDateFlexible(v);
-    return dt ? String(dt.getFullYear()) : "";
-  }
-
-  function getMonthKeyFromDateLike(v) {
-    const dt = parseDateFlexible(v);
-    if (!dt) return "";
-    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
-  }
-
-  /* =========================
-     GETTERS (SOLO LECTURA)
-  ========================= */
-  function getFacturas() {
-    return store.facturas;
-  }
-
-  function getFiltered() {
-    return store.filtered;
-  }
-
-  function getStats() {
-    return store.stats;
-  }
-
-  function getHistorico() {
-    return store.historico;
-  }
-
-  function getHistoricoFiltered() {
-    return store.historicoFiltered;
-  }
-
-  function getFilters() {
-    return store.filters;
-  }
-
-  function getHistoryFilters() {
-    return store.historyFilters;
-  }
-
-  function getUI() {
-    return store.ui;
-  }
-
-  function getMeta() {
-    return store.meta;
-  }
-
-  /* =========================
-     SETTERS (MUTACIÓN CONTROLADA)
-  ========================= */
-  function setFacturas(rows, { silent = false } = {}) {
-    store.facturas = safeArray(rows);
-    _touchMeta("lastLoadedAt");
-
-    _cacheSet(CACHE_KEYS.FACTURAS, store.facturas);
-
-    if (!silent) emit("facturas:changed", store.facturas);
-    return store.facturas;
-  }
-
-  function setFiltered(rows, { silent = false } = {}) {
-    store.filtered = safeArray(rows);
-    if (!silent) emit("filtered:changed", store.filtered);
-    return store.filtered;
-  }
-
-  function setStats(stats, { silent = false } = {}) {
-    store.stats = stats || null;
-    _touchMeta("lastStatsAt");
-
-    _cacheSet(CACHE_KEYS.STATS, store.stats);
-
-    if (!silent) emit("stats:changed", store.stats);
-    return store.stats;
-  }
-
-  function setHistorico(rows, { silent = false } = {}) {
-    store.historico = safeArray(rows);
-    _touchMeta("lastHistoricoAt");
-
-    _cacheSet(CACHE_KEYS.HISTORICO, store.historico);
-
-    if (!silent) emit("historico:changed", store.historico);
-    return store.historico;
-  }
-
-  function setHistoricoFiltered(rows, { silent = false } = {}) {
-    store.historicoFiltered = safeArray(rows);
-    if (!silent) emit("historico:filtered:changed", store.historicoFiltered);
-    return store.historicoFiltered;
-  }
-
-  function setFilters(next, { silent = false } = {}) {
-    store.filters = {
-      ...store.filters,
-      ...(next || {}),
+    const dia = Number(f.diaVencimiento);
+    if (!dia || dia < 1 || dia > 31) {
+      return { estadoCalculado: "sin_vencimiento", diasParaVencer: null, fechaVencimiento: "", venceTexto: "Sin vencimiento" };
+    }
+    const hoy = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate());
+    const venc = new Date(ref.getFullYear(), ref.getMonth(), Math.min(dia, lastDay(ref.getFullYear(), ref.getMonth())));
+    const diff = Math.ceil((venc - hoy) / 86400000);
+    let estado = "pendiente";
+    if (diff < 0) estado = "vencida";
+    else if (diff === 0) estado = "hoy";
+    else if (diff <= 3) estado = "urgente";
+    else if (diff <= 7) estado = "proxima";
+    const texto = diff < 0 ? `Vencida hace ${Math.abs(diff)} día${Math.abs(diff) === 1 ? "" : "s"}` :
+      diff === 0 ? "Vence hoy" : diff <= 7 ? `Vence en ${diff} día${diff === 1 ? "" : "s"}` : "Pendiente";
+    return {
+      estadoCalculado: estado,
+      diasParaVencer: diff,
+      fechaVencimiento: fmtInputDate(venc),
+      fechaVencimientoTexto: venc.toLocaleDateString("es-CO"),
+      venceTexto: texto,
     };
-    if (!silent) emit("filters:changed", store.filters);
-    return store.filters;
   }
-
-  function setHistoryFilters(next, { silent = false } = {}) {
-    store.historyFilters = {
-      ...store.historyFilters,
-      ...(next || {}),
+  function normalizeFactura(raw = {}) {
+    const base = {
+      row: Number(raw.row || raw.fila || 0),
+      factura: text(raw.factura || raw.nombre || raw.Nombre || raw.Factura),
+      referencia: text(raw.referencia || raw.ref || raw.Referencia || raw.Ref),
+      valorBase: num(raw.valorBase ?? raw.valor ?? raw.valorEstimado ?? raw["Valor Base"]),
+      estado: text(raw.estado || raw.estadoMensual),
+      metodo: text(raw.metodo || raw.metodoPago || raw["Método de Pago"]),
+      ultimoPago: text(raw.ultimoPago || raw.ultimo || raw.fechaPago || raw["Fecha de Pago"]),
+      diaVencimiento: Number(raw.diaVencimiento || raw.vencimiento || raw.diaCorte || raw["Día de Vencimiento"] || 0) || "",
+      categoria: text(raw.categoria || raw["Categoría"]),
+      responsable: text(raw.responsable),
+      presupuestoMensual: num(raw.presupuestoMensual ?? raw.presupuesto),
+      linkPago: text(raw.linkPago || raw["Link de Pago"]),
+      comprobante: text(raw.comprobante),
+      nota: text(raw.nota),
+      activa: raw.activa === false || norm(raw.activa) === "no" || norm(raw.activa) === "inactiva" ? false : true,
+      raw,
     };
-    if (!silent) emit("historyFilters:changed", store.historyFilters);
-    return store.historyFilters;
+    const backendStatus = text(raw.estadoCalculado);
+    return { ...base, ...calcLocalStatus(base), ...(backendStatus ? { estadoCalculado: backendStatus } : {}) };
   }
-
-  function setUI(next, { silent = false } = {}) {
-    store.ui = {
-      ...store.ui,
-      ...(next || {}),
+  function normalizeHistorico(raw = {}) {
+    const fecha = text(raw.fecha || raw.fechaPago || raw["Fecha de Pago"]);
+    return {
+      row: Number(raw.row || 0),
+      fecha,
+      mes: text(raw.mes) || (parseDate(fecha) ? monthKey(parseDate(fecha)) : ""),
+      factura: text(raw.factura || raw.nombre),
+      referencia: text(raw.referencia || raw.ref),
+      valorBase: num(raw.valorBase || raw.valor),
+      valorPagado: num(raw.valorPagado || raw.pagado),
+      estado: text(raw.estado || "Pagado"),
+      metodo: text(raw.metodo || raw.metodoPago),
+      categoria: text(raw.categoria),
+      responsable: text(raw.responsable),
+      nota: text(raw.nota),
+      comprobante: text(raw.comprobante),
+      rowFactura: Number(raw.rowFactura || raw["Row Factura"] || 0),
+      raw,
     };
-    if (!silent) emit("ui:changed", store.ui);
-    return store.ui;
   }
-
-  function setActiveStatsTab(tab, { silent = false } = {}) {
-    store.ui.activeStatsTab = String(tab || "resumen");
-    if (!silent) emit("ui:activeStatsTab", store.ui.activeStatsTab);
-    return store.ui.activeStatsTab;
+  function uniq(field) {
+    return [...new Set(store.facturas.map((f) => text(f[field])).filter(Boolean))].sort((a, b) => a.localeCompare(b, "es"));
   }
-
-  function markStatsTabLoaded(tab, { silent = false } = {}) {
-    const key = String(tab || "").trim();
-    if (!key) return store.ui.loadedStatsTabs;
-
-    if (!Array.isArray(store.ui.loadedStatsTabs)) {
-      store.ui.loadedStatsTabs = [];
-    }
-    if (!store.ui.loadedStatsTabs.includes(key)) {
-      store.ui.loadedStatsTabs.push(key);
-    }
-
-    if (!silent) emit("ui:loadedStatsTabs", store.ui.loadedStatsTabs);
-    return store.ui.loadedStatsTabs;
+  function statusRank(f) {
+    const map = { vencida: 0, hoy: 1, urgente: 2, proxima: 3, pendiente: 4, sin_vencimiento: 5, pagada: 6 };
+    return map[f.estadoCalculado] ?? 9;
   }
-
-  function setStatsOpen(isOpen, { silent = false } = {}) {
-    store.ui.statsOpen = !!isOpen;
-    if (!silent) emit("ui:statsOpen", store.ui.statsOpen);
-    return store.ui.statsOpen;
-  }
-
-  function setQuickPayOpen(isOpen, { silent = false } = {}) {
-    store.ui.quickPayOpen = !!isOpen;
-    if (!silent) emit("ui:quickPayOpen", store.ui.quickPayOpen);
-    return store.ui.quickPayOpen;
-  }
-
-  function setBusy(isBusy, { silent = false } = {}) {
-    store.meta.isBusy = !!isBusy;
-    if (!silent) emit("meta:busy", store.meta.isBusy);
-    return store.meta.isBusy;
-  }
-
-  function setError(msg, { silent = false } = {}) {
-    store.meta.lastError = String(msg || "");
-    if (!silent) emit("meta:error", store.meta.lastError);
-    return store.meta.lastError;
-  }
-
-  function clearError({ silent = false } = {}) {
-    store.meta.lastError = "";
-    if (!silent) emit("meta:error", store.meta.lastError);
-    return store.meta.lastError;
-  }
-
-  /* =========================
-     HELPERS DE NEGOCIO
-  ========================= */
-  function isPagoDelMes(fechaStr) {
-    const dt = parseDateFlexible(fechaStr);
-    if (!dt) return false;
-
-    const hoy = new Date();
-    return dt.getMonth() === hoy.getMonth() && dt.getFullYear() === hoy.getFullYear();
-  }
-
-  function extractMetodos() {
-    const set = new Set();
-    store.facturas.forEach((f) => {
-      const m = String(f?.metodo ?? "").trim();
-      if (m) set.add(m);
+  function applyFilters() {
+    const f = store.filters;
+    let rows = store.facturas.filter((x) => {
+      if (f.estado !== "all" && x.estadoCalculado !== f.estado) return false;
+      if (f.metodo !== "all" && x.metodo !== f.metodo) return false;
+      if (f.categoria !== "all" && x.categoria !== f.categoria) return false;
+      if (f.responsable !== "all" && x.responsable !== f.responsable) return false;
+      if (f.q) {
+        const q = norm(f.q);
+        if (![x.factura, x.referencia, x.metodo, x.categoria, x.responsable].some((v) => norm(v).includes(q))) return false;
+      }
+      return true;
     });
-    return [...set].sort((a, b) => a.localeCompare(b, "es"));
+    rows = sortFacturas(rows, f.orden);
+    store.filtered = rows;
+    emit("filtered", rows);
+    return rows;
   }
-
-  function extractHistoricoMetodos() {
-    const set = new Set();
-    store.historico.forEach((r) => {
-      const m = String(r?.metodo ?? "").trim();
-      if (m) set.add(m);
+  function sortFacturas(rows, orden = "urgencia") {
+    const out = rows.slice();
+    out.sort((a, b) => {
+      if (orden === "valor_desc") return b.valorBase - a.valorBase;
+      if (orden === "valor_asc") return a.valorBase - b.valorBase;
+      if (orden === "nombre") return a.factura.localeCompare(b.factura, "es");
+      if (orden === "ultimo_pago") return (parseDate(b.ultimoPago)?.getTime() || 0) - (parseDate(a.ultimoPago)?.getTime() || 0);
+      if (orden === "vencimiento") return (Number(a.diaVencimiento) || 99) - (Number(b.diaVencimiento) || 99);
+      return statusRank(a) - statusRank(b) || (Number(a.diasParaVencer) || 99) - (Number(b.diasParaVencer) || 99);
     });
-    return [...set].sort((a, b) => a.localeCompare(b, "es"));
+    return out;
   }
-
-  function extractHistoricoYears() {
-    const set = new Set();
-    store.historico.forEach((r) => {
-      const y = getYearFromDateLike(r?.fecha);
-      if (y) set.add(y);
-    });
-    return [...set].sort((a, b) => b.localeCompare(a));
-  }
-
-  function getTopMetodoFromFacturas() {
-    const acc = Object.create(null);
-
-    store.facturas.forEach((f) => {
-      const metodo = String(f?.metodo ?? "").trim();
-      if (!metodo) return;
-      const valor = Number(String(f?.valor ?? "").replace(/[^\d]/g, "")) || 0;
-      acc[metodo] = (acc[metodo] || 0) + valor;
-    });
-
-    const top = Object.entries(acc).sort((a, b) => b[1] - a[1])[0];
-    return top ? { metodo: top[0], total: top[1] } : null;
-  }
-
-  function getPendientesActuales() {
-    return store.facturas.filter((f) => !isPagoDelMes(f?.ultimo));
-  }
-
-  /* =========================
-     BOOT: HYDRATE DESDE CACHE
-  ========================= */
-  function hydrateFromCache() {
-    if (!CFG?.CACHE?.ENABLED) return;
-
-    const cachedFacturas = _cacheGet(CACHE_KEYS.FACTURAS);
-    const cachedStats = _cacheGet(CACHE_KEYS.STATS);
-    const cachedHistorico = _cacheGet(CACHE_KEYS.HISTORICO);
-
-    let hydratedSomething = false;
-
-    if (Array.isArray(cachedFacturas) && cachedFacturas.length) {
-      DBG("STATE hydrate: facturas desde cache");
-      setFacturas(cachedFacturas, { silent: true });
-      setFiltered(cachedFacturas, { silent: true });
-      hydratedSomething = true;
-    }
-
-    if (cachedStats) {
-      DBG("STATE hydrate: stats desde cache");
-      setStats(cachedStats, { silent: true });
-      hydratedSomething = true;
-    }
-
-    if (Array.isArray(cachedHistorico) && cachedHistorico.length) {
-      DBG("STATE hydrate: histórico desde cache");
-      setHistorico(cachedHistorico, { silent: true });
-      setHistoricoFiltered(cachedHistorico, { silent: true });
-      hydratedSomething = true;
-    }
-
-    if (hydratedSomething) {
-      emit("hydrate", {
-        facturas: !!cachedFacturas,
-        stats: !!cachedStats,
-        historico: !!cachedHistorico,
-      });
-    }
-  }
-
-  /* =========================
-     RESET / TOOLS
-  ========================= */
-  function reset({ keepCache = false } = {}) {
-    const fresh = structuredCloneSafe(DEFAULTS);
-
-    Object.keys(store).forEach((k) => delete store[k]);
-    Object.assign(store, fresh);
-
-    if (!keepCache) {
-      _cacheDel(CACHE_KEYS.FACTURAS);
-      _cacheDel(CACHE_KEYS.STATS);
-      _cacheDel(CACHE_KEYS.HISTORICO);
-    }
-
-    emit("reset", null);
-  }
-
-  function snapshot() {
-    return structuredCloneSafe(store);
-  }
-
-  function replaceAll(nextState, { silent = false } = {}) {
-    const fresh = structuredCloneSafe(DEFAULTS);
-    const merged = {
-      ...fresh,
-      ...(nextState || {}),
-      filters: {
-        ...fresh.filters,
-        ...(nextState?.filters || {}),
-      },
-      historyFilters: {
-        ...fresh.historyFilters,
-        ...(nextState?.historyFilters || {}),
-      },
-      ui: {
-        ...fresh.ui,
-        ...(nextState?.ui || {}),
-      },
-      meta: {
-        ...fresh.meta,
-        ...(nextState?.meta || {}),
-      },
+  function dashboard() {
+    const unpaid = store.facturas.filter((f) => f.estadoCalculado !== "pagada");
+    const vencidas = unpaid.filter((f) => f.estadoCalculado === "vencida");
+    const hoy = unpaid.filter((f) => f.estadoCalculado === "hoy");
+    const semana = unpaid.filter((f) => Number(f.diasParaVencer) >= 0 && Number(f.diasParaVencer) <= 7);
+    const prox = sortFacturas(unpaid, "urgencia").find((f) => f.estadoCalculado !== "sin_vencimiento") || null;
+    return {
+      vencidas,
+      hoy,
+      semana,
+      totalSemana: semana.reduce((a, f) => a + f.valorBase, 0),
+      proximoVencimiento: prox,
+      valorPendienteMes: unpaid.reduce((a, f) => a + f.valorBase, 0),
+      pagadasMes: store.facturas.filter((f) => f.estadoCalculado === "pagada"),
+      valorPagadoMes: store.facturas.filter((f) => f.estadoCalculado === "pagada").reduce((a, f) => a + f.valorBase, 0),
+      vencidasValor: vencidas.reduce((a, f) => a + f.valorBase, 0),
     };
-
-    Object.keys(store).forEach((k) => delete store[k]);
-    Object.assign(store, merged);
-
-    if (!silent) emit("replaceAll", snapshot());
-    return store;
+  }
+  function setFacturas(rows) {
+    store.facturas = (Array.isArray(rows) ? rows : []).map(normalizeFactura);
+    applyFilters();
+    emit("facturas", store.facturas);
+  }
+  function setHistorico(rows) {
+    store.historico = (Array.isArray(rows) ? rows : []).map(normalizeHistorico);
+    emit("historico", store.historico);
+  }
+  function setStats(stats) { store.stats = stats || null; emit("stats", store.stats); }
+  function setFilters(next) { store.filters = { ...store.filters, ...next }; return applyFilters(); }
+  function getByRow(row) { return store.facturas.find((f) => Number(f.row) === Number(row)); }
+  function findFactura(term) {
+    const q = norm(term);
+    return store.facturas.find((f) => norm(f.factura) === q || norm(f.referencia) === q || String(f.row) === String(term)) ||
+      store.facturas.find((f) => norm(f.factura).includes(q) || norm(f.referencia).includes(q));
   }
 
-  /* =========================
-     PUBLIC API
-  ========================= */
-  const PUBLIC = Object.freeze({
-    // events
-    on,
-    once,
-    off,
-
-    // getters
-    getFacturas,
-    getFiltered,
-    getStats,
-    getHistorico,
-    getHistoricoFiltered,
-    getFilters,
-    getHistoryFilters,
-    getUI,
-    getMeta,
-
-    // setters
-    setFacturas,
-    setFiltered,
-    setStats,
-    setHistorico,
-    setHistoricoFiltered,
-    setFilters,
-    setHistoryFilters,
-    setUI,
-    setActiveStatsTab,
-    markStatsTabLoaded,
-    setStatsOpen,
-    setQuickPayOpen,
-    setBusy,
-    setError,
-    clearError,
-
-    // helpers
-    normalizeText,
-    parseDateFlexible,
-    getYearFromDateLike,
-    getMonthKeyFromDateLike,
-    isPagoDelMes,
-    extractMetodos,
-    extractHistoricoMetodos,
-    extractHistoricoYears,
-    getTopMetodoFromFacturas,
-    getPendientesActuales,
-
-    // tools
-    reset,
-    snapshot,
-    replaceAll,
-
-    // debug
-    _dump: snapshot,
+  window.STATE = Object.freeze({
+    on, store, norm, num, text, parseDate, fmtInputDate, monthKey, isPaidThisMonth, calcLocalStatus,
+    normalizeFactura, normalizeHistorico, setFacturas, setHistorico, setStats, setFilters, applyFilters,
+    sortFacturas, dashboard, getByRow, findFactura,
+    getFacturas: () => store.facturas, getFiltered: () => store.filtered, getHistorico: () => store.historico, getStats: () => store.stats,
+    extractMetodos: () => uniq("metodo"), extractCategorias: () => uniq("categoria"), extractResponsables: () => uniq("responsable"),
   });
-
-  Object.defineProperty(window, "STATE", {
-    value: PUBLIC,
-    writable: false,
-    configurable: false,
-    enumerable: true,
-  });
-
-  hydrateFromCache();
 })();

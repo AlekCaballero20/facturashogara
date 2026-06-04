@@ -1,1128 +1,328 @@
 "use strict";
 
-/* ============================================================================
-  FACTURAS HOGAR ALEK · app.js (Orchestrator Pro v2)
-  - Boot robusto (anti doble carga)
-  - Refresh anti-race + UX busy
-  - Modal stats + modal quick pay
-  - Tabs con lazy loading
-  - Filtros principales + filtros de histórico
-  - Delegación: editar valor/método + registrar pago
-  - Fallbacks UI si todavía no existen funciones nuevas en ui.render.js
-============================================================================ */
-
 (() => {
-  /* =========================
-     ANTI DOBLE CARGA
-  ========================= */
-  if (window.__FACTURAS_APP_LOADED__) {
-    console.warn("[BOOT] app.js ya estaba cargado. Evito doble init.");
-    return;
-  }
-  window.__FACTURAS_APP_LOADED__ = true;
+  if (window.__HM_FACTURAS__) return;
+  window.__HM_FACTURAS__ = true;
 
-  /* =========================
-     REQUIRED MODULES
-  ========================= */
-  const CFG = window.CFG;
-  const STATE = window.STATE;
-  const API = window.API;
-  const UI = window.UI;
-
-  /* =========================
-     HARD GUARDS
-  ========================= */
-  function fail(msg) {
-    console.error(msg);
-    const el = document.querySelector("#mensaje");
-    if (el) {
-      el.textContent = msg;
-      el.className = "error";
-      el.classList.remove("hide");
-    }
-  }
-
-  (function assertModules() {
-    const missing = [];
-    if (!CFG) missing.push("CFG (config.js)");
-    if (!STATE) missing.push("STATE (state.js)");
-    if (!API) missing.push("API (services.api.js)");
-    if (!UI) missing.push("UI (ui.render.js)");
-
-    if (missing.length) {
-      fail("❌ Faltan módulos JS: " + missing.join(", ") + ". Revisa rutas y orden de <script>.");
-      throw new Error("Missing modules: " + missing.join(", "));
-    }
-  })();
-
-  /* =========================
-     DOM CACHE
-  ========================= */
-  const $ = (sel, ctx = document) => ctx.querySelector(sel);
-  const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
+  const { CFG, STATE, API, UI } = window;
+  const $ = UI.$;
+  const $$ = UI.$$;
+  let activeModal = null;
+  let lastFocus = null;
+  let statsTab = "resumen";
 
   const els = {
-    // Main
-    main: $("#main"),
-    tbody: $("#tbody"),
-    empty: $("#emptyState"),
-    mensaje: $("#mensaje"),
-    loader: $("#loader"),
-
-    // Main filters
-    q: $("#q"),
-    fEstado: $("#fEstado"),
-    fMetodo: $("#fMetodo"),
-    btnClearFilters: $("#btnClearFilters"),
-
-    // Main actions
-    btnRefresh: $("#btnRefresh"),
-    btnStats: $("#btnStats"),
-    btnQuickPay: $("#btnQuickPay"),
-
-    // Stats modal
-    statsModal: $("#statsModal"),
-    btnCloseStats: $("#btnCloseStats"),
-    statsTabs: $$("#statsModal .tab"),
-    statsPanels: $$("#statsModal .tab-panel"),
-
-    // Stats containers
-    statsBody: $("#statsBody"),
-    statsMetodos: $("#statsMetodos"),
-    statsMeses: $("#statsMeses"),
-    statsHistorico: $("#statsHistorico"),
-    statsProyeccion: $("#statsProyeccion"),
-    statsPendientes: $("#statsPendientes"),
-
-    // History filters
-    historyQ: $("#historyQ"),
-    historyYear: $("#historyYear"),
-    historyMethod: $("#historyMethod"),
-
-    // Quick pay modal
-    quickPayModal: $("#quickPayModal"),
-    btnCloseQuickPay: $("#btnCloseQuickPay"),
-    quickPayForm: $("#quickPayForm"),
-    btnSubmitQuickPay: $("#btnSubmitQuickPay"),
-    quickFactura: $("#quickFactura"),
-    quickValor: $("#quickValor"),
-    quickMetodo: $("#quickMetodo"),
-    quickFecha: $("#quickFecha"),
-    quickNota: $("#quickNota"),
+    q: $("#q"), fEstado: $("#fEstado"), fMetodo: $("#fMetodo"), fCategoria: $("#fCategoria"), fResponsable: $("#fResponsable"), fOrden: $("#fOrden"),
+    payForm: $("#payForm"), editForm: $("#editForm"), closeMonthForm: $("#closeMonthForm"),
   };
 
-  /* =========================
-     INTERNAL STATE
-  ========================= */
-  let refreshToken = 0;
-  let lastFocusEl = null;
-  let statsLoaded = false;
-  let historicoLoaded = false;
-  let activeModal = null;
-
-  const localState = {
-    historicoRows: [],
-    historyFiltered: [],
-    statsData: null,
-    loadedTabs: new Set(["resumen"]),
-  };
-
-  /* =========================
-     UTILS
-  ========================= */
-  function debounce(fn, wait = 180) {
-    let t = null;
-    return (...args) => {
-      clearTimeout(t);
-      t = setTimeout(() => fn(...args), wait);
-    };
-  }
-
-  function escapeHtml(str) {
-    return String(str ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
-
-  const money = new Intl.NumberFormat(CFG?.LOCALE ?? "es-CO", {
-    style: "currency",
-    currency: CFG?.CURRENCY ?? "COP",
-    maximumFractionDigits: 0,
-  });
-
-  function fmtCOP(n) {
-    return money.format(Number(n || 0));
-  }
-
-  function parseCOP(str) {
-    if (str == null) return null;
-    const digits = String(str).replace(/[^\d]/g, "");
-    if (!digits) return null;
-    return Number(digits);
-  }
-
-  function normalizeText(v) {
-    return String(v ?? "")
-      .trim()
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "");
-  }
-
-  function parseDateFlexible(v) {
-    if (!v) return null;
-    if (v instanceof Date && !isNaN(v.getTime())) return v;
-
-    const s = String(v).trim();
-    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-    if (m) {
-      const d = Number(m[1]);
-      const mo = Number(m[2]) - 1;
-      const y = Number(m[3].length === 2 ? "20" + m[3] : m[3]);
-      const dt = new Date(y, mo, d);
-      return isNaN(dt.getTime()) ? null : dt;
-    }
-
-    const dt = new Date(s);
-    return isNaN(dt.getTime()) ? null : dt;
-  }
-
-  function formatDateInputValue(date = new Date()) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, "0");
-    const d = String(date.getDate()).padStart(2, "0");
-    return `${y}-${m}-${d}`;
-  }
-
-  function getYearFromAnyDate(v) {
-    const dt = parseDateFlexible(v);
-    return dt ? String(dt.getFullYear()) : "";
-  }
-
-  function getMonthKeyFromAnyDate(v) {
-    const dt = parseDateFlexible(v);
-    if (!dt) return "";
-    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
-  }
-
-  function esPagoDelMes(fechaStr) {
-    if (STATE && typeof STATE.isPagoDelMes === "function") {
-      return STATE.isPagoDelMes(fechaStr);
-    }
-
-    const dt = parseDateFlexible(fechaStr);
-    if (!dt) return false;
-
-    const hoy = new Date();
-    return dt.getMonth() === hoy.getMonth() && dt.getFullYear() === hoy.getFullYear();
-  }
-
-  function setBusy(isBusy) {
-    UI?.setBusy?.(isBusy);
-    if (els.main) els.main.setAttribute("aria-busy", isBusy ? "true" : "false");
-    if (els.loader) els.loader.classList.toggle("hide", !isBusy);
-  }
-
-  function toast(msg, type = "ok") {
-    UI?.toast?.(msg, type);
-  }
-
-  function getFacturas() {
-    return (STATE?.getFacturas?.() ?? STATE?.facturas ?? []);
-  }
-
-  function getSavedFilters() {
-    return STATE?.getFilters?.() ?? STATE?.filters ?? { q: "", estado: "all", metodo: "all" };
-  }
-
-  function setSavedFilters(next) {
-    if (typeof STATE?.setFilters === "function") STATE.setFilters(next);
-    else STATE.filters = { ...(STATE.filters || {}), ...(next || {}) };
-  }
-
-  function setFiltered(rows) {
-    if (typeof STATE?.setFiltered === "function") STATE.setFiltered(rows);
-    else STATE.filtered = rows;
-  }
-
-  function setStatsData(s) {
-    localState.statsData = s || null;
-    if (typeof STATE?.setStats === "function") STATE.setStats(s);
-    else STATE.stats = s;
-  }
-
-  function getStatsData() {
-    return localState.statsData || STATE?.getStats?.() || STATE?.stats || null;
-  }
-
-  /* =========================
-     MAIN FILTERS + KPIS
-  ========================= */
-  function buildMetodoOptions() {
-    if (!els.fMetodo) return;
-
-    const methods =
-      typeof STATE?.extractMetodos === "function"
-        ? STATE.extractMetodos()
-        : (() => {
-            const set = new Set();
-            getFacturas().forEach((f) => {
-              const m = String(f?.metodo ?? "").trim();
-              if (m) set.add(m);
-            });
-            return [...set].sort((a, b) => a.localeCompare(b, "es"));
-          })();
-
-    const current = els.fMetodo.value || "all";
-    els.fMetodo.innerHTML =
-      `<option value="all">Todos</option>` +
-      methods.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("");
-
-    els.fMetodo.value = methods.includes(current) || current === "all" ? current : "all";
-  }
-
-  function populateQuickFacturaOptions() {
-    if (!els.quickFactura) return;
-
-    const facturas = getFacturas();
-    const current = els.quickFactura.value || "";
-
-    els.quickFactura.innerHTML =
-      `<option value="">Selecciona una factura</option>` +
-      facturas
-        .map((f) => {
-          const nombre = String(f?.nombre ?? "").trim();
-          const valor = Number(f?.valor || 0);
-          return `<option value="${escapeHtml(nombre)}">${escapeHtml(nombre)} · ${escapeHtml(fmtCOP(valor))}</option>`;
-        })
-        .join("");
-
-    if ([...els.quickFactura.options].some((o) => o.value === current)) {
-      els.quickFactura.value = current;
-    }
-  }
-
-  function applyFilters() {
-    const q = normalizeText(els.q?.value || "");
-    const estado = els.fEstado?.value || "all";
-    const metodo = els.fMetodo?.value || "all";
-
-    setSavedFilters({ q, estado, metodo });
-
-    const facturas = getFacturas();
-
-    const out = facturas.filter((f) => {
-      const pagado = esPagoDelMes(f?.ultimo);
-      const m = String(f?.metodo ?? "").trim();
-
-      if (estado === "pagado" && !pagado) return false;
-      if (estado === "pendiente" && pagado) return false;
-      if (metodo !== "all" && m !== metodo) return false;
-
-      if (q) {
-        const hay =
-          normalizeText(f?.nombre).includes(q) ||
-          normalizeText(f?.referencia).includes(q) ||
-          normalizeText(f?.metodo).includes(q);
-        if (!hay) return false;
-      }
-
-      return true;
-    });
-
-    setFiltered(out);
-    UI?.renderTable?.(out);
-
-    const has = out.length > 0;
-    els.empty?.classList.toggle("hide", has);
-    if (els.tbody && !has) els.tbody.textContent = "";
-  }
-
-  function updateKPIs() {
-    UI?.renderKPIs?.(getFacturas());
-  }
-
-  function restoreSavedFiltersToUI() {
-    const saved = getSavedFilters();
-    if (els.q && typeof saved.q === "string") els.q.value = saved.q;
-    if (els.fEstado && saved.estado) els.fEstado.value = saved.estado;
-    if (els.fMetodo && saved.metodo) els.fMetodo.value = saved.metodo;
-  }
-
-  /* =========================
-     MODALS
-  ========================= */
-  function openModal(modalEl) {
-    if (!modalEl) return;
-    lastFocusEl = document.activeElement;
-    activeModal = modalEl;
-
-    modalEl.classList.remove("hide");
+  function debounce(fn, wait) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), wait); }; }
+  function openModal(id) {
+    const modal = typeof id === "string" ? $(id) : id;
+    if (!modal) return;
+    lastFocus = document.activeElement;
+    activeModal = modal;
+    modal.classList.remove("hide");
     document.body.style.overflow = "hidden";
-
-    const focusTarget =
-      modalEl.querySelector("[data-close]") ||
-      modalEl.querySelector("button, input, select, textarea");
-    focusTarget?.focus?.();
+    setTimeout(() => modal.querySelector("button,input,select,textarea")?.focus(), 0);
+  }
+  function closeModal(modal) {
+    if (!modal) return;
+    modal.classList.add("hide");
+    if (activeModal === modal) activeModal = null;
+    if (!$(".modal:not(.hide)")) document.body.style.overflow = "";
+    lastFocus?.focus?.();
+  }
+  function closeAll() { $$(".modal").forEach(closeModal); }
+  function parseMoney(v) { return STATE.num(v); }
+  function validURL(v) {
+    if (!String(v || "").trim()) return true;
+    try { new URL(v); return true; } catch { return false; }
+  }
+  function htmlDateToDMY(v) {
+    if (!v) return "";
+    const [y, m, d] = v.split("-");
+    return `${Number(d)}/${Number(m)}/${y}`;
+  }
+  function download(name, content, type = "text/csv;charset=utf-8") {
+    const blob = new Blob([content], { type });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+  function csv(rows) {
+    return rows.map((row) => row.map((v) => `"${String(v ?? "").replaceAll('"', '""')}"`).join(",")).join("\n");
   }
 
-  function closeModal(modalEl) {
-    if (!modalEl) return;
-
-    modalEl.classList.add("hide");
-    if (activeModal === modalEl) activeModal = null;
-
-    if (!els.statsModal || els.statsModal.classList.contains("hide")) {
-      if (!els.quickPayModal || els.quickPayModal.classList.contains("hide")) {
-        document.body.style.overflow = "";
-      }
-    }
-
-    lastFocusEl?.focus?.();
-    lastFocusEl = null;
-  }
-
-  function trapFocusInModal(ev) {
-    if (!activeModal || activeModal.classList.contains("hide")) return;
-    if (ev.key !== "Tab") return;
-
-    const focusables = activeModal.querySelectorAll(
-      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-    );
-
-    const list = Array.from(focusables).filter(
-      (el) =>
-        !el.hasAttribute("disabled") &&
-        !el.classList.contains("hide") &&
-        el.offsetParent !== null
-    );
-
-    if (!list.length) return;
-
-    const first = list[0];
-    const last = list[list.length - 1];
-
-    if (ev.shiftKey && document.activeElement === first) {
-      ev.preventDefault();
-      last.focus();
-    } else if (!ev.shiftKey && document.activeElement === last) {
-      ev.preventDefault();
-      first.focus();
-    }
-  }
-
-  /* =========================
-     STATS MODAL + TABS
-  ========================= */
-  function switchStatsTab(key) {
-    els.statsTabs.forEach((t) => {
-      const on = t.dataset.tab === key;
-      t.classList.toggle("is-active", on);
-      t.setAttribute("aria-selected", on ? "true" : "false");
-      t.setAttribute("tabindex", on ? "0" : "-1");
-    });
-
-    els.statsPanels.forEach((p) => {
-      const on = p.id.toLowerCase() === `tab${key}`.toLowerCase();
-      p.classList.toggle("hide", !on);
-    });
-
-    handleStatsTabLazyLoad(key);
-  }
-
-  async function openStatsModal() {
-    openModal(els.statsModal);
-    switchStatsTab("resumen");
-
-    if (!statsLoaded) {
-      await loadStats();
-    }
-  }
-
-  function closeStatsModal() {
-    closeModal(els.statsModal);
-  }
-
-  async function handleStatsTabLazyLoad(key) {
-    if (key === "resumen" || key === "metodos" || key === "meses" || key === "pendientes" || key === "proyeccion") {
-      if (!statsLoaded) await loadStats();
-      else renderStatsEverywhere();
-      return;
-    }
-
-    if (key === "historico") {
-      if (!historicoLoaded) await loadHistorico();
-      else {
-        buildHistoryFilterOptions();
-        applyHistoryFilters();
-      }
-    }
-  }
-
-  function resetStatsPanelsLoading() {
-    if (els.statsBody) els.statsBody.innerHTML = `<p class="muted">Cargando estadísticas…</p>`;
-    if (els.statsMetodos) els.statsMetodos.innerHTML = `<p class="muted">Cargando métodos…</p>`;
-    if (els.statsMeses) els.statsMeses.innerHTML = `<p class="muted">Cargando meses…</p>`;
-    if (els.statsPendientes) els.statsPendientes.innerHTML = `<p class="muted">Cargando pendientes…</p>`;
-    if (els.statsProyeccion) els.statsProyeccion.innerHTML = `<p class="muted">Cargando proyección…</p>`;
-  }
-
-  async function loadStats() {
-    resetStatsPanelsLoading();
-
+  async function refresh(force = true) {
     try {
-      setBusy(true);
-      const s = await API.stats();
-      setStatsData(s);
-      statsLoaded = true;
-      renderStatsEverywhere();
+      UI.busy(true);
+      const rows = await API.listarFacturas({ force });
+      STATE.setFacturas(rows);
+      UI.renderFilterOptions();
+      renderAll();
+      loadStatsSoft();
     } catch (err) {
-      const msg = `❌ Error: ${escapeHtml(err.message)}`;
-      if (els.statsBody) els.statsBody.innerHTML = `<p class="muted">${msg}</p>`;
-      if (els.statsMetodos) els.statsMetodos.innerHTML = `<p class="muted">${msg}</p>`;
-      if (els.statsMeses) els.statsMeses.innerHTML = `<p class="muted">${msg}</p>`;
-      if (els.statsPendientes) els.statsPendientes.innerHTML = `<p class="muted">${msg}</p>`;
-      if (els.statsProyeccion) els.statsProyeccion.innerHTML = `<p class="muted">${msg}</p>`;
+      console.error(err);
+      UI.toast("No se pudo cargar la información. Revisa la conexión o el despliegue de Apps Script.", "error");
     } finally {
-      setBusy(false);
+      UI.busy(false);
     }
   }
-
-  function renderStatsEverywhere() {
-    const s = getStatsData();
-    const facturas = getFacturas();
-
-    UI?.renderStats?.(s, facturas);
-
-    if (typeof UI?.renderProjection === "function") {
-      UI.renderProjection(s, facturas);
-    } else {
-      renderProjectionFallback(s, facturas);
-    }
-  }
-
-  function renderProjectionFallback(s, facturas) {
-    if (!els.statsProyeccion) return;
-
-    const list = Array.isArray(facturas) ? facturas : [];
-    const pagadasMes = list.filter((f) => esPagoDelMes(f?.ultimo));
-    const totalActual = pagadasMes.reduce((acc, f) => acc + (Number(f?.valor || 0) || 0), 0);
-
-    const avg6 =
-      Number(s?.promedioUltimos6Meses ?? s?.promedioPago ?? 0) || 0;
-
-    const proy =
-      Number(s?.proyeccionMesActual ?? totalActual) || totalActual;
-
-    const delta = avg6 ? ((proy - avg6) / avg6) * 100 : 0;
-    const deltaTxt =
-      avg6 === 0
-        ? "Sin base suficiente"
-        : `${delta >= 0 ? "+" : ""}${delta.toFixed(1)}% vs promedio`;
-
-    els.statsProyeccion.innerHTML = `
-      <div class="stats-grid">
-        <div class="stat">
-          <div class="k">Total actual del mes</div>
-          <div class="v">${escapeHtml(fmtCOP(totalActual))}</div>
-        </div>
-        <div class="stat">
-          <div class="k">Promedio base</div>
-          <div class="v">${escapeHtml(fmtCOP(avg6))}</div>
-        </div>
-        <div class="stat">
-          <div class="k">Proyección de cierre</div>
-          <div class="v">${escapeHtml(fmtCOP(proy))}</div>
-        </div>
-        <div class="stat">
-          <div class="k">Variación estimada</div>
-          <div class="v">${escapeHtml(deltaTxt)}</div>
-        </div>
-      </div>
-      <p class="muted" style="margin-top:12px">
-        Esta sección usa los datos disponibles del backend. Si luego metemos
-        promedio de 6 meses y proyección real, queda bastante más fina y menos intuitiva a punta de fe.
-      </p>
-    `;
-  }
-
-  /* =========================
-     HISTÓRICO
-  ========================= */
-  function normalizeHistoricoResponse(json) {
-    if (!json) return [];
-    if (Array.isArray(json)) return json;
-    if (Array.isArray(json.rows)) return json.rows;
-    if (Array.isArray(json.data)) return json.data;
-    return [];
-  }
-
-  async function loadHistorico() {
-    if (els.statsHistorico) {
-      els.statsHistorico.innerHTML = `<p class="muted">Cargando histórico…</p>`;
-    }
-
+  async function loadStatsSoft() {
     try {
-      setBusy(true);
-
-      let rows = [];
-      if (typeof API.historial === "function") {
-        const resp = await API.historial();
-        rows = normalizeHistoricoResponse(resp);
-      } else {
-        rows = buildHistoricoFallbackFromStats(getStatsData());
-      }
-
-      localState.historicoRows = Array.isArray(rows) ? rows : [];
-      historicoLoaded = true;
-
-      buildHistoryFilterOptions();
-      applyHistoryFilters();
+      const [stats, hist] = await Promise.all([API.stats({ force: true }), API.historial({}, { force: true })]);
+      STATE.setStats(stats);
+      STATE.setHistorico(hist);
+      populateHistoryFilters();
+      renderAll();
+      if (!$(`#statsModal`).classList.contains("hide")) UI.renderStats(statsTab, filterHistory());
     } catch (err) {
-      if (els.statsHistorico) {
-        els.statsHistorico.innerHTML = `<p class="muted">❌ Error cargando histórico: ${escapeHtml(err.message)}</p>`;
-      }
+      console.warn(err);
+    }
+  }
+  function renderAll() {
+    UI.renderKPIs();
+    UI.renderDueDashboard();
+    UI.renderTable(STATE.getFiltered());
+  }
+  function applyFiltersFromUI() {
+    STATE.setFilters({
+      q: els.q.value,
+      estado: els.fEstado.value,
+      metodo: els.fMetodo.value,
+      categoria: els.fCategoria.value,
+      responsable: els.fResponsable.value,
+      orden: els.fOrden.value,
+    });
+    UI.renderTable(STATE.getFiltered());
+  }
+  function fillPayForm(f = null) {
+    $("#payForm").reset();
+    $("#payFecha").value = window.__TIME__.todayInputValue();
+    $("#payRow").value = f?.row || "";
+    $("#paySearch").value = f ? f.factura : "";
+    $("#payValorBase").value = f ? UI.fmtCOP(f.valorBase) : "";
+    $("#payValor").value = f ? String(f.valorBase) : "";
+    $("#payMetodo").value = f?.metodo || "";
+    $("#payCategoria").value = f?.categoria || "";
+    $("#payResponsable").value = f?.responsable || "";
+    $("#payNota").value = "";
+    $("#payComprobante").value = "";
+    $("#paySelectedInfo").classList.toggle("hide", !f);
+    $("#paySelectedInfo").classList.toggle("warning", !!f && f.estadoCalculado === "pagada");
+    $("#paySelectedInfo").innerHTML = f ? `${UI.badge(f.estadoCalculado)} <strong>${UI.esc(f.factura)}</strong> · ${UI.esc(f.referencia || "Sin referencia")}<br>${f.estadoCalculado === "pagada" ? "Esta factura ya aparece pagada este mes. Puedes registrar otro pago si fue parcial, duplicado o ajuste." : UI.esc(f.venceTexto || "")}` : "";
+    $("#payPortalWrap").classList.toggle("hide", !f?.linkPago);
+    $("#payPortalWrap").innerHTML = f?.linkPago ? `<a class="btn ghost" href="${UI.esc(f.linkPago)}" target="_blank" rel="noopener">Abrir portal de pago</a>` : "";
+  }
+  function openPay(row) {
+    fillPayForm(row ? STATE.getByRow(row) : null);
+    openModal("#payModal");
+  }
+  function fillEditForm(f) {
+    $("#editForm").reset();
+    $("#editRow").value = f.row;
+    $("#editSubtitle").textContent = `${f.factura} · ${f.referencia || "Sin referencia"}`;
+    $("#editValorBase").value = String(f.valorBase || "");
+    $("#editMetodo").value = f.metodo || "";
+    $("#editDia").value = f.diaVencimiento || "";
+    $("#editCategoria").value = f.categoria || "";
+    $("#editResponsable").value = f.responsable || "";
+    $("#editPresupuesto").value = f.presupuestoMensual || "";
+    $("#editLinkPago").value = f.linkPago || "";
+    $("#editNota").value = f.nota || "";
+    $("#editActiva").checked = f.activa !== false;
+  }
+  function openEdit(row) {
+    const f = STATE.getByRow(row);
+    if (!f) return;
+    fillEditForm(f);
+    openModal("#editModal");
+  }
+  async function submitPay(ev) {
+    ev.preventDefault();
+    let f = STATE.getByRow($("#payRow").value) || STATE.findFactura($("#paySearch").value);
+    const valorPagado = parseMoney($("#payValor").value);
+    if (!f && !$("#paySearch").value.trim()) return UI.toast("Selecciona o busca una factura.", "error");
+    if (!valorPagado || valorPagado <= 0) return UI.toast("Escribe un valor pagado positivo.", "error");
+    if (!validURL($("#payComprobante").value)) return UI.toast("El comprobante debe ser una URL válida.", "error");
+    const payload = {
+      row: f?.row || "",
+      factura: f?.factura || $("#paySearch").value.trim(),
+      valorPagado,
+      metodo: $("#payMetodo").value.trim(),
+      fecha: htmlDateToDMY($("#payFecha").value),
+      categoria: $("#payCategoria").value.trim(),
+      responsable: $("#payResponsable").value.trim(),
+      nota: $("#payNota").value.trim(),
+      comprobante: $("#payComprobante").value.trim(),
+    };
+    try {
+      UI.busy(true);
+      if (payload.row) await API.registrarPago(payload);
+      else await API.quickPay(payload);
+      UI.toast("Pago registrado correctamente.", "ok");
+      closeModal($("#payModal"));
+      await refresh(true);
+    } catch (err) {
+      console.error(err);
+      UI.toast("No se pudo registrar el pago. Inténtalo nuevamente.", "error");
     } finally {
-      setBusy(false);
+      UI.busy(false);
     }
   }
-
-  function buildHistoricoFallbackFromStats(stats) {
-    // Fallback modesto: si no hay endpoint historial, al menos no revienta.
-    // No inventa pagos. Solo muestra vacío con base en backend actual.
-    if (!stats || !Array.isArray(stats?.ultimosPagos)) return [];
-    return stats.ultimosPagos;
-  }
-
-  function buildHistoryFilterOptions() {
-    const rows = localState.historicoRows || [];
-
-    if (els.historyYear) {
-      const years = [...new Set(rows.map((r) => getYearFromAnyDate(r?.fecha)).filter(Boolean))]
-        .sort((a, b) => b.localeCompare(a));
-
-      const current = els.historyYear.value || "all";
-      els.historyYear.innerHTML =
-        `<option value="all">Todos</option>` +
-        years.map((y) => `<option value="${escapeHtml(y)}">${escapeHtml(y)}</option>`).join("");
-
-      els.historyYear.value = years.includes(current) || current === "all" ? current : "all";
-    }
-
-    if (els.historyMethod) {
-      const methods = [...new Set(
-        rows.map((r) => String(r?.metodo ?? "").trim()).filter(Boolean)
-      )].sort((a, b) => a.localeCompare(b, "es"));
-
-      const current = els.historyMethod.value || "all";
-      els.historyMethod.innerHTML =
-        `<option value="all">Todos</option>` +
-        methods.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("");
-
-      els.historyMethod.value = methods.includes(current) || current === "all" ? current : "all";
+  async function submitEdit(ev) {
+    ev.preventDefault();
+    const payload = {
+      row: $("#editRow").value,
+      valorBase: parseMoney($("#editValorBase").value),
+      metodo: $("#editMetodo").value.trim(),
+      diaVencimiento: $("#editDia").value,
+      categoria: $("#editCategoria").value.trim(),
+      responsable: $("#editResponsable").value.trim(),
+      presupuestoMensual: parseMoney($("#editPresupuesto").value),
+      linkPago: $("#editLinkPago").value.trim(),
+      nota: $("#editNota").value.trim(),
+      activa: $("#editActiva").checked ? "Sí" : "No",
+    };
+    if (!payload.valorBase || payload.valorBase <= 0) return UI.toast("El valor base debe ser positivo.", "error");
+    if (payload.diaVencimiento && (Number(payload.diaVencimiento) < 1 || Number(payload.diaVencimiento) > 31)) return UI.toast("El día de vencimiento debe estar entre 1 y 31.", "error");
+    if (payload.presupuestoMensual < 0) return UI.toast("El presupuesto no puede ser negativo.", "error");
+    if (!validURL(payload.linkPago)) return UI.toast("El link de pago debe ser una URL válida.", "error");
+    try {
+      UI.busy(true);
+      await API.editarFactura(payload);
+      UI.toast("Factura actualizada.", "ok");
+      closeModal($("#editModal"));
+      await refresh(true);
+    } catch (err) {
+      console.error(err);
+      UI.toast("No se pudo editar la factura. Revisa la conexión o el despliegue.", "error");
+    } finally {
+      UI.busy(false);
     }
   }
-
-  function applyHistoryFilters() {
-    const rows = localState.historicoRows || [];
-
-    const q = normalizeText(els.historyQ?.value || "");
-    const year = els.historyYear?.value || "all";
-    const method = els.historyMethod?.value || "all";
-
-    const filtered = rows.filter((r) => {
-      const rowYear = getYearFromAnyDate(r?.fecha);
-      const rowMethod = String(r?.metodo ?? "").trim();
-
-      if (year !== "all" && rowYear !== year) return false;
-      if (method !== "all" && rowMethod !== method) return false;
-
-      if (q) {
-        const hay =
-          normalizeText(r?.factura).includes(q) ||
-          normalizeText(r?.referencia).includes(q) ||
-          normalizeText(r?.metodo).includes(q) ||
-          normalizeText(r?.estado).includes(q) ||
-          normalizeText(r?.fecha).includes(q);
-        if (!hay) return false;
-      }
-
+  async function openHistory(row) {
+    const f = STATE.getByRow(row);
+    if (!f) return;
+    openModal("#historyModal");
+    $("#historyBody").innerHTML = UI.emptyHTML("Cargando historial", "Un momento...");
+    try {
+      const rows = await API.historial({ factura: f.factura, referencia: f.referencia, limit: 100 }, { force: true });
+      const normalized = rows.map(STATE.normalizeHistorico);
+      UI.renderFacturaHistory(f, normalized);
+    } catch {
+      const local = STATE.getHistorico().filter((r) => STATE.norm(r.factura) === STATE.norm(f.factura) || STATE.norm(r.referencia) === STATE.norm(f.referencia));
+      UI.renderFacturaHistory(f, local);
+    }
+  }
+  function populateHistoryFilters() {
+    const rows = STATE.getHistorico();
+    const years = [...new Set(rows.map((r) => STATE.parseDate(r.fecha)?.getFullYear()).filter(Boolean))].sort((a, b) => b - a);
+    const months = [...new Set(rows.map((r) => r.mes).filter(Boolean))].sort().reverse();
+    const methods = [...new Set(rows.map((r) => r.metodo).filter(Boolean))].sort();
+    const cats = [...new Set(rows.map((r) => r.categoria).filter(Boolean))].sort();
+    const set = (sel, vals, all) => { const el = $(sel); if (el) el.innerHTML = `<option value="all">${all}</option>` + vals.map((v) => `<option value="${UI.esc(v)}">${UI.esc(v)}</option>`).join(""); };
+    set("#historyYear", years, "Todos"); set("#historyMonth", months, "Todos"); set("#historyMethod", methods, "Todos"); set("#historyCategory", cats, "Todas");
+  }
+  function filterHistory() {
+    const q = STATE.norm($("#historyQ").value);
+    const y = $("#historyYear").value, m = $("#historyMonth").value, method = $("#historyMethod").value, cat = $("#historyCategory").value;
+    return STATE.getHistorico().filter((r) => {
+      const d = STATE.parseDate(r.fecha);
+      if (y !== "all" && String(d?.getFullYear()) !== String(y)) return false;
+      if (m !== "all" && r.mes !== m) return false;
+      if (method !== "all" && r.metodo !== method) return false;
+      if (cat !== "all" && r.categoria !== cat) return false;
+      if (q && ![r.factura, r.referencia, r.metodo, r.categoria, r.nota].some((v) => STATE.norm(v).includes(q))) return false;
       return true;
     });
-
-    localState.historyFiltered = filtered;
-
-    if (typeof UI?.renderHistorico === "function") {
-      UI.renderHistorico(filtered);
-    } else {
-      renderHistoricoFallback(filtered);
+  }
+  async function openStats() {
+    openModal("#statsModal");
+    UI.renderStats(statsTab, filterHistory());
+    if (!STATE.getStats()) await loadStatsSoft();
+  }
+  async function previewMonth() {
+    const mes = $("#closeMonthInput").value || window.__TIME__.monthInputValue();
+    $("#closeMonthInput").value = mes;
+    UI.renderClosePreview(null);
+    try {
+      const res = await API.resumenMes({ mes });
+      UI.renderClosePreview(res.resumen || res);
+    } catch {
+      const d = STATE.dashboard();
+      UI.renderClosePreview({ totalPagado: d.valorPagadoMes, totalPendiente: d.valorPendienteMes, facturasPagadas: d.pagadasMes.length, facturasPendientes: STATE.getFacturas().length - d.pagadasMes.length, facturasVencidas: d.vencidas.length, valorVencido: d.vencidasValor });
+      UI.toast("Se mostró un resumen local porque el backend no respondió.", "error");
     }
   }
-
-  function renderHistoricoFallback(rows) {
-    if (!els.statsHistorico) return;
-
-    const list = Array.isArray(rows) ? rows : [];
-
-    if (!list.length) {
-      els.statsHistorico.innerHTML = `
-        <div class="empty">
-          <div class="empty-emoji" aria-hidden="true">🧾</div>
-          <div class="empty-title">No hay movimientos para mostrar</div>
-          <div class="empty-sub muted">Prueba cambiando los filtros del histórico.</div>
-        </div>
-      `;
-      return;
-    }
-
-    const htmlRows = list
-      .slice()
-      .sort((a, b) => {
-        const da = parseDateFlexible(a?.fecha)?.getTime() || 0;
-        const db = parseDateFlexible(b?.fecha)?.getTime() || 0;
-        return db - da;
-      })
-      .map((r) => {
-        const factura = escapeHtml(r?.factura ?? r?.nombre ?? "—");
-        const referencia = escapeHtml(r?.referencia ?? "—");
-        const metodo = escapeHtml(r?.metodo ?? "—");
-        const estado = escapeHtml(r?.estado ?? "Pagado");
-        const fecha = escapeHtml(r?.fecha ?? "—");
-        const valorPagado = fmtCOP(r?.valorPagado ?? r?.valor ?? 0);
-
-        return `
-          <tr>
-            <td>${fecha}</td>
-            <td>${factura}</td>
-            <td>${referencia}</td>
-            <td>${escapeHtml(valorPagado)}</td>
-            <td>${metodo}</td>
-            <td>${estado}</td>
-          </tr>
-        `;
-      })
-      .join("");
-
-    els.statsHistorico.innerHTML = `
-      <div class="mini-table-wrap">
-        <table class="tabla">
-          <thead>
-            <tr>
-              <th>Fecha</th>
-              <th>Factura</th>
-              <th>Referencia</th>
-              <th>Valor pagado</th>
-              <th>Método</th>
-              <th>Estado</th>
-            </tr>
-          </thead>
-          <tbody>${htmlRows}</tbody>
-        </table>
-      </div>
-      <p class="muted" style="margin-top:12px">
-        Mostrando ${list.length} registro(s).
-      </p>
-    `;
-  }
-
-  /* =========================
-     QUICK PAY
-  ========================= */
-  function openQuickPayModal() {
-    populateQuickFacturaOptions();
-
-    if (els.quickPayForm) els.quickPayForm.reset();
-    if (els.quickFecha) els.quickFecha.value = formatDateInputValue(new Date());
-
-    openModal(els.quickPayModal);
-  }
-
-  function closeQuickPayModal() {
-    closeModal(els.quickPayModal);
-  }
-
-  function findFacturaByName(nombre) {
-    const norm = normalizeText(nombre);
-    return getFacturas().find((f) => normalizeText(f?.nombre) === norm) || null;
-  }
-
-  async function submitQuickPay(ev) {
+  async function submitCloseMonth(ev) {
     ev.preventDefault();
-
-    const factura = String(els.quickFactura?.value || "").trim();
-    const valorPagado = parseCOP(els.quickValor?.value || "");
-    const metodo = String(els.quickMetodo?.value || "").trim();
-    const fecha = String(els.quickFecha?.value || "").trim();
-    const nota = String(els.quickNota?.value || "").trim();
-
-    if (!factura) {
-      toast("Selecciona una factura.", "error");
-      els.quickFactura?.focus?.();
-      return;
-    }
-
-    if (valorPagado == null || !Number.isFinite(valorPagado)) {
-      toast("Escribe un valor pagado válido.", "error");
-      els.quickValor?.focus?.();
-      return;
-    }
-
-    const submitBtn = els.btnSubmitQuickPay;
-    if (submitBtn) submitBtn.disabled = true;
-
+    if (!confirm("¿Cerrar este mes y guardar el snapshot en Google Sheets?")) return;
     try {
-      setBusy(true);
-
-      if (typeof API.quickPay === "function") {
-        await API.quickPay({ factura, valorPagado, metodo, fecha, nota });
-      } else {
-        // fallback sensato: buscamos row y usamos registrarPago normal
-        const facturaObj = findFacturaByName(factura);
-        if (!facturaObj?.row) {
-          throw new Error("No existe API.quickPay y no pude ubicar la fila de esa factura.");
-        }
-        await API.registrarPago(facturaObj.row);
-      }
-
-      toast("Pago rápido registrado ✅", "ok");
-      closeQuickPayModal();
-
-      statsLoaded = false;
-      historicoLoaded = false;
-
-      await refresh();
-
-      if (els.statsModal && !els.statsModal.classList.contains("hide")) {
-        await loadStats();
-      }
+      await API.cerrarMes({ mes: $("#closeMonthInput").value, observaciones: $("#closeMonthNotes").value.trim() });
+      UI.toast("Cierre mensual guardado.", "ok");
+      closeModal($("#closeMonthModal"));
     } catch (err) {
-      console.error(err);
-      toast("Error registrando pago rápido: " + err.message, "error");
-    } finally {
-      setBusy(false);
-      if (submitBtn) submitBtn.disabled = false;
+      UI.toast(err.message || "No se pudo hacer el cierre mensual.", "error");
     }
   }
-
-  /* =========================
-     EDITABLE CELLS
-  ========================= */
-  function setCellTextSafely(cell, text) {
-    cell.textContent = text;
+  function exportFiltered() {
+    const rows = [["Factura", "Referencia", "Valor Base", "Estado", "Vence", "Método", "Categoría", "Responsable", "Último Pago"], ...STATE.getFiltered().map((f) => [f.factura, f.referencia, f.valorBase, f.estadoCalculado, f.venceTexto, f.metodo, f.categoria, f.responsable, f.ultimoPago])];
+    if (rows.length <= 1) return UI.toast("No hay datos para exportar.", "error");
+    download("facturas-filtradas.csv", csv(rows));
   }
-
-  document.addEventListener("focusin", (ev) => {
-    const cellValor = ev.target.closest(".editable.valor");
-    const cellMetodo = ev.target.closest(".editable.metodo");
-
-    if (cellValor) {
-      const v = Number(cellValor.dataset.valor || 0);
-      cellValor.dataset.orig = String(v);
-      setCellTextSafely(cellValor, String(v));
-      cellValor.classList.add("editing");
-      return;
-    }
-
-    if (cellMetodo) {
-      const orig = String(cellMetodo.dataset.metodo || "").trim();
-      cellMetodo.dataset.origMetodo = orig;
-      setCellTextSafely(cellMetodo, orig);
-      cellMetodo.classList.add("editing");
-    }
-  });
-
-  document.addEventListener("input", (ev) => {
-    const cell = ev.target.closest(".editable.valor");
-    if (!cell) return;
-
-    const digits = cell.textContent.replace(/[^\d]/g, "");
-    if (cell.textContent !== digits) setCellTextSafely(cell, digits);
-  });
-
-  document.addEventListener("keydown", (ev) => {
-    const cellValor = ev.target.closest(".editable.valor");
-    const cellMetodo = ev.target.closest(".editable.metodo");
-
-    if (!cellValor && !cellMetodo) {
-      trapFocusInModal(ev);
-
-      if (ev.key === "Escape") {
-        if (els.quickPayModal && !els.quickPayModal.classList.contains("hide")) {
-          closeQuickPayModal();
-          return;
-        }
-        if (els.statsModal && !els.statsModal.classList.contains("hide")) {
-          closeStatsModal();
-        }
-      }
-      return;
-    }
-
-    if (ev.key === "Enter") {
-      ev.preventDefault();
-      (cellValor || cellMetodo).blur();
-      return;
-    }
-
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-
-      if (cellValor) {
-        const origNum = Number(cellValor.dataset.orig || cellValor.dataset.valor || 0);
-        setCellTextSafely(cellValor, fmtCOP(origNum));
-        cellValor.blur();
-        return;
-      }
-
-      if (cellMetodo) {
-        const orig = String(cellMetodo.dataset.origMetodo || cellMetodo.dataset.metodo || "").trim();
-        setCellTextSafely(cellMetodo, orig || "—");
-        cellMetodo.blur();
-      }
-    }
-  });
-
-  document.addEventListener(
-    "focusout",
-    async (ev) => {
-      const cell = ev.target.closest(".editable.valor");
-      if (!cell) return;
-
-      cell.classList.remove("editing");
-
-      const tr = cell.closest("tr");
-      const row = Number(tr?.dataset?.row);
-
-      const origNum = Number(cell.dataset.orig || cell.dataset.valor || 0);
-      const newNum = parseCOP(cell.textContent);
-
-      if (!Number.isFinite(row) || newNum === null || newNum === origNum) {
-        setCellTextSafely(cell, fmtCOP(origNum));
-        return;
-      }
-
-      try {
-        await API.editarValor(row, newNum);
-        cell.dataset.valor = String(newNum);
-        setCellTextSafely(cell, fmtCOP(newNum));
-
-        toast("Valor actualizado 💰", "ok");
-
-        statsLoaded = false;
-        updateKPIs();
-        await refreshIfStatsOpen();
-      } catch (err) {
-        console.error(err);
-        setCellTextSafely(cell, fmtCOP(origNum));
-        toast("Error al editar valor: " + err.message, "error");
-      }
-    },
-    true
-  );
-
-  document.addEventListener(
-    "focusout",
-    async (ev) => {
-      const cell = ev.target.closest(".editable.metodo");
-      if (!cell) return;
-
-      cell.classList.remove("editing");
-
-      const tr = cell.closest("tr");
-      const row = Number(tr?.dataset?.row);
-
-      const orig = String(cell.dataset.origMetodo || "").trim();
-      const nuevo = String(cell.textContent || "").trim();
-
-      if (!Number.isFinite(row) || nuevo === orig) {
-        cell.dataset.metodo = orig;
-        setCellTextSafely(cell, orig || "—");
-        return;
-      }
-
-      if (typeof API.editarMetodo !== "function") {
-        cell.dataset.metodo = orig;
-        setCellTextSafely(cell, orig || "—");
-        toast("editarMetodo aún no existe en services.api.js", "error");
-        return;
-      }
-
-      try {
-        await API.editarMetodo(row, nuevo);
-        cell.dataset.metodo = nuevo;
-        setCellTextSafely(cell, nuevo || "—");
-
-        toast("Método actualizado 💳", "ok");
-
-        statsLoaded = false;
-        buildMetodoOptions();
-        updateKPIs();
-        await refreshIfStatsOpen();
-      } catch (err) {
-        console.error(err);
-        cell.dataset.metodo = orig;
-        setCellTextSafely(cell, orig || "—");
-        toast("Error al editar método: " + err.message, "error");
-      }
-    },
-    true
-  );
-
-  /* =========================
-     REGISTRAR PAGO DESDE TABLA
-  ========================= */
-  document.addEventListener("click", async (ev) => {
-    const btn = ev.target.closest("button[data-action='registrar']");
-    if (!btn) return;
-
-    const row = Number(btn.dataset.row);
-    const tr = btn.closest("tr");
-    if (!Number.isFinite(row)) return;
-
-    btn.disabled = true;
-    const prevTxt = btn.textContent;
-    btn.textContent = "⏳";
-
-    try {
-      const r = await API.registrarPago(row);
-      const fecha = r?.fecha ?? "";
-
-      const $fecha = tr?.querySelector(".fecha");
-      const $estado = tr?.querySelector(".estado");
-
-      if ($fecha) $fecha.textContent = fecha || "";
-      if ($estado) {
-        $estado.innerHTML = esPagoDelMes(fecha)
-          ? `<span class="badge ok">Pagado</span>`
-          : `<span class="badge pendiente">Pendiente</span>`;
-      }
-
-      toast("Pago registrado ✅", "ok");
-
-      statsLoaded = false;
-      historicoLoaded = false;
-
-      await refresh();
-
-      if (els.statsModal && !els.statsModal.classList.contains("hide")) {
-        await loadStats();
-      }
-    } catch (err) {
-      console.error(err);
-      toast("Error al registrar: " + err.message, "error");
-    } finally {
-      btn.disabled = false;
-      btn.textContent = prevTxt || "Registrar";
-    }
-  });
-
-  /* =========================
-     REFRESH / BOOT
-  ========================= */
-  async function refresh() {
-    const token = ++refreshToken;
-
-    try {
-      setBusy(true);
-      if (els.btnRefresh) els.btnRefresh.disabled = true;
-
-      const rows = await API.listarFacturas();
-      if (token !== refreshToken) return;
-
-      if (typeof STATE?.setFacturas === "function") STATE.setFacturas(rows);
-      else STATE.facturas = rows;
-
-      buildMetodoOptions();
-      populateQuickFacturaOptions();
-      updateKPIs();
-      restoreSavedFiltersToUI();
-      applyFilters();
-    } catch (err) {
-      if (token !== refreshToken) return;
-
-      console.error(err);
-      if (els.tbody) els.tbody.textContent = "";
-      els.empty?.classList.remove("hide");
-      toast("Error cargando: " + err.message, "error");
-    } finally {
-      if (token === refreshToken) {
-        setBusy(false);
-        if (els.btnRefresh) els.btnRefresh.disabled = false;
-      }
-    }
+  async function exportHistory() {
+    if (!STATE.getHistorico().length) await loadStatsSoft();
+    const rows = [["Fecha", "Mes", "Factura", "Referencia", "Valor Pagado", "Método", "Categoría", "Responsable", "Nota", "Comprobante"], ...STATE.getHistorico().map((r) => [r.fecha, r.mes, r.factura, r.referencia, r.valorPagado, r.metodo, r.categoria, r.responsable, r.nota, r.comprobante])];
+    if (rows.length <= 1) return UI.toast("No hay histórico para exportar.", "error");
+    download("historico-pagos.csv", csv(rows));
   }
-
-  async function refreshIfStatsOpen() {
-    if (els.statsModal && !els.statsModal.classList.contains("hide")) {
-      await loadStats();
-      if (!$("#tabHistorico")?.classList.contains("hide") && historicoLoaded) {
-        await loadHistorico();
-      }
-    }
+  function exportMonthSummary() {
+    const d = STATE.dashboard();
+    download("resumen-mensual.txt", `Hogar Manager · Facturas\nMes: ${window.__TIME__.monthInputValue()}\nTotal pagado: ${UI.fmtCOP(d.valorPagadoMes)}\nTotal pendiente: ${UI.fmtCOP(d.valorPendienteMes)}\nFacturas pagadas: ${d.pagadasMes.length}\nFacturas pendientes: ${STATE.getFacturas().length - d.pagadasMes.length}\nFacturas vencidas: ${d.vencidas.length}\n`);
   }
-
-  /* =========================
-     EVENTS
-  ========================= */
-  const onSearch = debounce(applyFilters, CFG?.DEBOUNCE_MS ?? 180);
-  const onHistorySearch = debounce(applyHistoryFilters, CFG?.DEBOUNCE_MS ?? 180);
-
-  els.q?.addEventListener("input", onSearch);
-  els.fEstado?.addEventListener("change", applyFilters);
-  els.fMetodo?.addEventListener("change", applyFilters);
-
-  els.btnClearFilters?.addEventListener("click", () => {
-    if (els.q) els.q.value = "";
-    if (els.fEstado) els.fEstado.value = "all";
-    if (els.fMetodo) els.fMetodo.value = "all";
-    applyFilters();
-  });
-
-  els.btnRefresh?.addEventListener("click", refresh);
-  els.btnStats?.addEventListener("click", openStatsModal);
-  els.btnCloseStats?.addEventListener("click", closeStatsModal);
-
-  els.btnQuickPay?.addEventListener("click", openQuickPayModal);
-  els.btnCloseQuickPay?.addEventListener("click", closeQuickPayModal);
-  els.quickPayForm?.addEventListener("submit", submitQuickPay);
-
-  els.statsTabs.forEach((t) => {
-    t.addEventListener("click", () => switchStatsTab(t.dataset.tab));
-  });
-
-  els.historyQ?.addEventListener("input", onHistorySearch);
-  els.historyYear?.addEventListener("change", applyHistoryFilters);
-  els.historyMethod?.addEventListener("change", applyHistoryFilters);
 
   document.addEventListener("click", (ev) => {
-    const closeStats = ev.target.closest("[data-close='stats']");
-    if (closeStats) {
-      closeStatsModal();
-      return;
-    }
-
-    const closeQuick = ev.target.closest("[data-close='quickpay']");
-    if (closeQuick) {
-      closeQuickModal();
-    }
+    const close = ev.target.closest("[data-close]");
+    if (close) return closeModal(close.closest(".modal"));
+    const btn = ev.target.closest("[data-action]");
+    if (!btn) return;
+    const row = btn.dataset.row;
+    if (btn.dataset.action === "pay") openPay(row);
+    if (btn.dataset.action === "edit") openEdit(row);
+    if (btn.dataset.action === "history") openHistory(row);
   });
+  document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeAll(); });
+  ["input", "change"].forEach((eventName) => {
+    [els.q, els.fEstado, els.fMetodo, els.fCategoria, els.fResponsable, els.fOrden].forEach((el) => el?.addEventListener(eventName, eventName === "input" ? debounce(applyFiltersFromUI, CFG.DEBOUNCE_MS) : applyFiltersFromUI));
+  });
+  $("#btnClearFilters").addEventListener("click", () => {
+    els.q.value = ""; els.fEstado.value = "all"; els.fMetodo.value = "all"; els.fCategoria.value = "all"; els.fResponsable.value = "all"; els.fOrden.value = "urgencia"; applyFiltersFromUI();
+  });
+  $("#btnRefresh").addEventListener("click", () => refresh(true));
+  $("#btnOpenPay").addEventListener("click", () => openPay(null));
+  $("#btnStats").addEventListener("click", openStats);
+  $("#btnExport").addEventListener("click", () => openModal("#exportModal"));
+  $("#btnCloseMonth").addEventListener("click", () => { $("#closeMonthInput").value = window.__TIME__.monthInputValue(); openModal("#closeMonthModal"); previewMonth(); });
+  $("#paySearch").addEventListener("change", () => fillPayForm(STATE.findFactura($("#paySearch").value)));
+  els.payForm.addEventListener("submit", submitPay);
+  els.editForm.addEventListener("submit", submitEdit);
+  $("#btnPreviewMonth").addEventListener("click", previewMonth);
+  els.closeMonthForm.addEventListener("submit", submitCloseMonth);
+  $("#exportFiltered").addEventListener("click", exportFiltered);
+  $("#exportHistory").addEventListener("click", exportHistory);
+  $("#exportMonthSummary").addEventListener("click", exportMonthSummary);
+  $$("#statsModal .tab").forEach((tab) => tab.addEventListener("click", () => {
+    statsTab = tab.dataset.tab;
+    $$("#statsModal .tab").forEach((t) => t.classList.toggle("is-active", t === tab));
+    UI.renderStats(statsTab, filterHistory());
+  }));
+  ["#historyQ", "#historyYear", "#historyMonth", "#historyMethod", "#historyCategory"].forEach((sel) => $(sel)?.addEventListener("input", () => UI.renderStats("historico", filterHistory())));
+  ["#historyYear", "#historyMonth", "#historyMethod", "#historyCategory"].forEach((sel) => $(sel)?.addEventListener("change", () => UI.renderStats("historico", filterHistory())));
 
-  function closeQuickModal() {
-    closeQuickPayModal();
-  }
-
-  /* =========================
-     BOOT
-  ========================= */
-  function boot() {
-    if (els.quickFecha && !els.quickFecha.value) {
-      els.quickFecha.value = formatDateInputValue(new Date());
-    }
-    refresh();
-  }
-
-  boot();
+  STATE.on("filtered", UI.renderTable);
+  refresh(false);
 })();
